@@ -2168,7 +2168,7 @@ def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, fli
     xm.master_print("saving np.savez")
     np.savez(
         npz_path,
-        latents=,
+        latents=latents_tensor,
         original_size=np.array(original_size),
         crop_ltrb=np.array(crop_ltrb),
         **kwargs,
