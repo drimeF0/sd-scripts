@@ -259,3 +259,4 @@ def _main():
     parser = setup_parser()
     args = parser.parse_args()
     main(args)
+_main()
