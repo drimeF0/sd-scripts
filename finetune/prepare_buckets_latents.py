@@ -10,7 +10,6 @@ from PIL import Image
 import cv2
 
 import torch
-from accelerate import Accelerator, DistributedType
 import torch_xla.core.xla_model as xm
 
 
@@ -58,8 +57,7 @@ def get_npz_filename(data_dir, image_key, is_full_path, recursive):
 
 
 def main(args):
-
-    accelerator = Accelerator()
+    DEVICE = xm.xla_device()
     # assert args.bucket_reso_steps % 8 == 0, f"bucket_reso_steps must be divisible by 8 / bucket_reso_stepは8で割り切れる必要があります"
     if args.bucket_reso_steps % 8 > 0:
         logger.warning(f"resolution of buckets in training time is a multiple of 8 / 学習時の各bucketの解像度は8単位になります")
@@ -86,7 +84,7 @@ def main(args):
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
+    vae = model_util.load_vae(args.model_name_or_path, weight_dtype).to(DEVICE)
 
     # bucketのサイズを計算する
     max_reso = tuple([int(t) for t in args.max_resolution.split(",")])
@@ -121,7 +119,6 @@ def main(args):
         collate_fn=collate_fn_remove_corrupted,
         drop_last=False,
     )
-    vae,data = accelerator.prepare(vae,data)
     vae.eval()
     bucket_counts = {}
     for data_entry in tqdm(data, smoothing=0.0):
