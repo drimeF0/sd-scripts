@@ -10,7 +10,6 @@ from PIL import Image
 import cv2
 
 import torch
-import torch_xla.core.xla_model as xm
 from accelerate import Accelerator, DistributedType
 
 from torchvision import transforms
@@ -109,7 +108,6 @@ def main(args):
             if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
                 train_util.cache_batch_latents(vae, True, bucket, args.flip_aug, False)
                 bucket.clear()
-                xm.mark_step()
 
     # 読み込みの高速化のためにDataLoaderを使うオプション
     dataset = train_util.ImageLoadingDataset(image_paths)

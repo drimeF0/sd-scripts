@@ -33,6 +33,7 @@ import toml
 from tqdm import tqdm
 
 import torch
+import torch_xla.core.xla_model as xm
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -2413,12 +2414,12 @@ def cache_batch_latents(
     img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
 
     with torch.no_grad():
-        latents = vae.encode(img_tensors).latent_dist.sample().to("cpu").detach()
+        latents = vae.encode(img_tensors).latent_dist.sample().cpu().detach()
 
     if flip_aug:
         img_tensors = torch.flip(img_tensors, dims=[3])
         with torch.no_grad():
-            flipped_latents = vae.encode(img_tensors).latent_dist.sample().to("cpu").detach()
+            flipped_latents = vae.encode(img_tensors).latent_dist.sample().cpu().detach()
     else:
         flipped_latents = [None] * len(latents)
 
@@ -2433,6 +2434,7 @@ def cache_batch_latents(
             info.latents = latent
             if flip_aug:
                 info.latents_flipped = flipped_latent
+    xm.mark_step()
 
 
 def cache_batch_text_encoder_outputs(
