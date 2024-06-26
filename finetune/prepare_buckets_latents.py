@@ -10,7 +10,8 @@ from PIL import Image
 import cv2
 
 import torch
-from library.device_utils import init_ipex, get_preferred_device
+from accelerate import Accelerator, DistributedType
+from library.device_utils import init_ipex
 init_ipex()
 
 from torchvision import transforms
@@ -22,7 +23,6 @@ setup_logging()
 import logging
 logger = logging.getLogger(__name__)
 
-DEVICE = get_preferred_device()
 
 IMAGE_TRANSFORMS = transforms.Compose(
     [
@@ -57,6 +57,8 @@ def get_npz_filename(data_dir, image_key, is_full_path, recursive):
 
 
 def main(args):
+
+    accelerator = Accelerator()
     # assert args.bucket_reso_steps % 8 == 0, f"bucket_reso_steps must be divisible by 8 / bucket_reso_stepは8で割り切れる必要があります"
     if args.bucket_reso_steps % 8 > 0:
         logger.warning(f"resolution of buckets in training time is a multiple of 8 / 学習時の各bucketの解像度は8単位になります")
@@ -85,7 +87,6 @@ def main(args):
 
     vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
     vae.eval()
-    vae.to(DEVICE, dtype=weight_dtype)
 
     # bucketのサイズを計算する
     max_reso = tuple([int(t) for t in args.max_resolution.split(",")])
@@ -111,19 +112,15 @@ def main(args):
                 bucket.clear()
 
     # 読み込みの高速化のためにDataLoaderを使うオプション
-    if args.max_data_loader_n_workers is not None:
-        dataset = train_util.ImageLoadingDataset(image_paths)
-        data = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=args.max_data_loader_n_workers,
-            collate_fn=collate_fn_remove_corrupted,
-            drop_last=False,
-        )
-    else:
-        data = [[(None, ip)] for ip in image_paths]
-
+    dataset = train_util.ImageLoadingDataset(image_paths)
+    data = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        collate_fn=collate_fn_remove_corrupted,
+        drop_last=False,
+    )
+    vae,data = accelerator.prepare(vae,data)
     bucket_counts = {}
     for data_entry in tqdm(data, smoothing=0.0):
         if data_entry[0] is None:
@@ -260,6 +257,5 @@ def setup_parser() -> argparse.ArgumentParser:
 
 def _main():
     parser = setup_parser()
-
     args = parser.parse_args()
     main(args)
