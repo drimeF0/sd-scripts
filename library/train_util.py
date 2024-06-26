@@ -2157,9 +2157,18 @@ def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, fli
     kwargs = {}
     if flipped_latents_tensor is not None:
         kwargs["latents_flipped"] = flipped_latents_tensor.detach().float().cpu().numpy()
+    xm.master_print("detach")
+    latents_tensor = latents_tensor.detach()
+    xm.master_print("float")
+    latents_tensor = latents_tensor.float()
+    xm.master_print("cpu")
+    latents_tensor = latents_tensor.cpu()
+    xm.master_print("numpy")
+    latents_tensor = latents_tensor.numpy()
+    xm.master_print("saving np.savez")
     np.savez(
         npz_path,
-        latents=latents_tensor.detach().float().cpu().numpy(),
+        latents=,
         original_size=np.array(original_size),
         crop_ltrb=np.array(crop_ltrb),
         **kwargs,
