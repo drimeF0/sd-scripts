@@ -33,7 +33,6 @@ import toml
 from tqdm import tqdm
 
 import torch
-import torch_xla.core.xla_model as xm
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -2157,10 +2156,10 @@ def load_latents_from_disk(
 def save_latents_to_disk(npz_path, latents_tensor, original_size, crop_ltrb, flipped_latents_tensor=None):
     kwargs = {}
     if flipped_latents_tensor is not None:
-        kwargs["latents_flipped"] = flipped_latents_tensor.float().cpu().numpy()
+        kwargs["latents_flipped"] = flipped_latents_tensor.detach().float().cpu().numpy()
     np.savez(
         npz_path,
-        latents=latents_tensor.float().cpu().numpy(),
+        latents=latents_tensor.detach().float().cpu().numpy(),
         original_size=np.array(original_size),
         crop_ltrb=np.array(crop_ltrb),
         **kwargs,
@@ -2414,19 +2413,16 @@ def cache_batch_latents(
     img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
 
     with torch.no_grad():
-        latents = vae.encode(img_tensors).latent_dist.sample().cpu().detach()
+        latents = vae.encode(img_tensors).latent_dist.sample()#.cpu().detach()
 
     if flip_aug:
         img_tensors = torch.flip(img_tensors, dims=[3])
         with torch.no_grad():
-            flipped_latents = vae.encode(img_tensors).latent_dist.sample().cpu().detach()
+            flipped_latents = vae.encode(img_tensors).latent_dist.sample()#.cpu().detach()
     else:
         flipped_latents = [None] * len(latents)
 
     for info, latent, flipped_latent in zip(image_infos, latents, flipped_latents):
-        # check NaN
-        if torch.isnan(latents).any() or (flipped_latent is not None and torch.isnan(flipped_latent).any()):
-            raise RuntimeError(f"NaN detected in latents: {info.absolute_path}")
 
         if cache_to_disk:
             save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent)
@@ -2434,7 +2430,6 @@ def cache_batch_latents(
             info.latents = latent
             if flip_aug:
                 info.latents_flipped = flipped_latent
-    xm.mark_step()
 
 
 def cache_batch_text_encoder_outputs(

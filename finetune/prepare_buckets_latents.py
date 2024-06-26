@@ -11,6 +11,8 @@ import cv2
 
 import torch
 from accelerate import Accelerator, DistributedType
+import torch_xla.core.xla_model as xm
+
 
 from torchvision import transforms
 
@@ -84,7 +86,6 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     vae = model_util.load_vae(args.model_name_or_path, weight_dtype)
-    vae.eval()
 
     # bucketのサイズを計算する
     max_reso = tuple([int(t) for t in args.max_resolution.split(",")])
@@ -107,6 +108,7 @@ def main(args):
         for bucket in bucket_manager.buckets:
             if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
                 train_util.cache_batch_latents(vae, True, bucket, args.flip_aug, False)
+                xm.mark_step()
                 bucket.clear()
 
     # 読み込みの高速化のためにDataLoaderを使うオプション
@@ -119,11 +121,11 @@ def main(args):
         drop_last=False,
     )
     vae,data = accelerator.prepare(vae,data)
+    vae.eval()
     bucket_counts = {}
     for data_entry in tqdm(data, smoothing=0.0):
         if data_entry[0] is None:
             continue
-
         img_tensor, image_path = data_entry[0]
         if img_tensor is not None:
             image = transforms.functional.to_pil_image(img_tensor)
