@@ -106,6 +106,7 @@ def main(args):
     def process_batch(is_last):
         for bucket in bucket_manager.buckets:
             if (is_last and len(bucket) > 0) or len(bucket) >= args.batch_size:
+                xm.master_print("processing bucket in process_batch")
                 train_util.cache_batch_latents(vae, True, bucket, args.flip_aug, False)
                 xm.mark_step()
                 bucket.clear()
@@ -122,11 +123,13 @@ def main(args):
     vae.eval()
     bucket_counts = {}
     for data_entry in tqdm(data, smoothing=0.0):
+        xm.master_print("starting new batch")
         if data_entry[0] is None:
             continue
         img_tensor, image_path = data_entry[0]
         if img_tensor is not None:
             image = transforms.functional.to_pil_image(img_tensor)
+            xm.master_print("image transformed")
         else:
             try:
                 image = Image.open(image_path)
@@ -177,7 +180,9 @@ def main(args):
         bucket_manager.add_image(reso, image_info)
 
         # バッチを推論するか判定して推論する
+        xm.master_print("start process_batch")
         process_batch(False)
+        xm.master_print("end process_batch")
         xm.mark_step()
 
     # 残りを処理する

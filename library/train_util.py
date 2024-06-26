@@ -33,9 +33,9 @@ import toml
 from tqdm import tqdm
 
 import torch
-from library.device_utils import init_ipex, clean_memory_on_device
+import torch_xla.core.xla_model as xm
+from library.device_utils import clean_memory_on_device
 
-init_ipex()
 
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
@@ -2411,7 +2411,9 @@ def cache_batch_latents(
 
     img_tensors = torch.stack(images, dim=0)
     img_tensors = img_tensors.to(device=vae.device, dtype=vae.dtype)
+    
 
+    xm.master_print("vae encoding")
     with torch.no_grad():
         latents = vae.encode(img_tensors).latent_dist.sample()#.cpu().detach()
 
@@ -2425,6 +2427,7 @@ def cache_batch_latents(
     for info, latent, flipped_latent in zip(image_infos, latents, flipped_latents):
 
         if cache_to_disk:
+            xm.master_print("saving to disk")
             save_latents_to_disk(info.latents_npz, latent, info.latents_original_size, info.latents_crop_ltrb, flipped_latent)
         else:
             info.latents = latent
