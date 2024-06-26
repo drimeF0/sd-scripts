@@ -11,7 +11,7 @@ import cv2
 
 import torch
 from accelerate import Accelerator, DistributedType
-import torch_xla.core.xla_model as xm
+import torch_xla as xla
 
 
 from torchvision import transforms
@@ -124,62 +124,63 @@ def main(args):
     vae.eval()
     bucket_counts = {}
     for data_entry in tqdm(data, smoothing=0.0):
-        if data_entry[0] is None:
-            continue
-        img_tensor, image_path = data_entry[0]
-        if img_tensor is not None:
-            image = transforms.functional.to_pil_image(img_tensor)
-        else:
-            try:
-                image = Image.open(image_path)
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
-            except Exception as e:
-                logger.error(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
+        with xla.step():
+            if data_entry[0] is None:
                 continue
+            img_tensor, image_path = data_entry[0]
+            if img_tensor is not None:
+                image = transforms.functional.to_pil_image(img_tensor)
+            else:
+                try:
+                    image = Image.open(image_path)
+                    if image.mode != "RGB":
+                        image = image.convert("RGB")
+                except Exception as e:
+                    logger.error(f"Could not load image path / 画像を読み込めません: {image_path}, error: {e}")
+                    continue
 
-        image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
-        if image_key not in metadata:
-            metadata[image_key] = {}
+            image_key = image_path if args.full_path else os.path.splitext(os.path.basename(image_path))[0]
+            if image_key not in metadata:
+                metadata[image_key] = {}
 
-        # 本当はこのあとの部分もDataSetに持っていけば高速化できるがいろいろ大変
+            # 本当はこのあとの部分もDataSetに持っていけば高速化できるがいろいろ大変
 
-        reso, resized_size, ar_error = bucket_manager.select_bucket(image.width, image.height)
-        img_ar_errors.append(abs(ar_error))
-        bucket_counts[reso] = bucket_counts.get(reso, 0) + 1
+            reso, resized_size, ar_error = bucket_manager.select_bucket(image.width, image.height)
+            img_ar_errors.append(abs(ar_error))
+            bucket_counts[reso] = bucket_counts.get(reso, 0) + 1
 
-        # メタデータに記録する解像度はlatent単位とするので、8単位で切り捨て
-        metadata[image_key]["train_resolution"] = (reso[0] - reso[0] % 8, reso[1] - reso[1] % 8)
+            # メタデータに記録する解像度はlatent単位とするので、8単位で切り捨て
+            metadata[image_key]["train_resolution"] = (reso[0] - reso[0] % 8, reso[1] - reso[1] % 8)
 
-        if not args.bucket_no_upscale:
-            # upscaleを行わないときには、resize後のサイズは、bucketのサイズと、縦横どちらかが同じであることを確認する
-            assert (
-                resized_size[0] == reso[0] or resized_size[1] == reso[1]
-            ), f"internal error, resized size not match: {reso}, {resized_size}, {image.width}, {image.height}"
+            if not args.bucket_no_upscale:
+                # upscaleを行わないときには、resize後のサイズは、bucketのサイズと、縦横どちらかが同じであることを確認する
+                assert (
+                    resized_size[0] == reso[0] or resized_size[1] == reso[1]
+                ), f"internal error, resized size not match: {reso}, {resized_size}, {image.width}, {image.height}"
+                assert (
+                    resized_size[0] >= reso[0] and resized_size[1] >= reso[1]
+                ), f"internal error, resized size too small: {reso}, {resized_size}, {image.width}, {image.height}"
+
             assert (
                 resized_size[0] >= reso[0] and resized_size[1] >= reso[1]
-            ), f"internal error, resized size too small: {reso}, {resized_size}, {image.width}, {image.height}"
+            ), f"internal error resized size is small: {resized_size}, {reso}"
 
-        assert (
-            resized_size[0] >= reso[0] and resized_size[1] >= reso[1]
-        ), f"internal error resized size is small: {resized_size}, {reso}"
+            # 既に存在するファイルがあればshape等を確認して同じならskipする
+            npz_file_name = get_npz_filename(args.train_data_dir, image_key, args.full_path, args.recursive)
+            if args.skip_existing:
+                if train_util.is_disk_cached_latents_is_expected(reso, npz_file_name, args.flip_aug):
+                    continue
 
-        # 既に存在するファイルがあればshape等を確認して同じならskipする
-        npz_file_name = get_npz_filename(args.train_data_dir, image_key, args.full_path, args.recursive)
-        if args.skip_existing:
-            if train_util.is_disk_cached_latents_is_expected(reso, npz_file_name, args.flip_aug):
-                continue
+            # バッチへ追加
+            image_info = train_util.ImageInfo(image_key, 1, "", False, image_path)
+            image_info.latents_npz = npz_file_name
+            image_info.bucket_reso = reso
+            image_info.resized_size = resized_size
+            image_info.image = image
+            bucket_manager.add_image(reso, image_info)
 
-        # バッチへ追加
-        image_info = train_util.ImageInfo(image_key, 1, "", False, image_path)
-        image_info.latents_npz = npz_file_name
-        image_info.bucket_reso = reso
-        image_info.resized_size = resized_size
-        image_info.image = image
-        bucket_manager.add_image(reso, image_info)
-
-        # バッチを推論するか判定して推論する
-        process_batch(False)
+            # バッチを推論するか判定して推論する
+            process_batch(False)
 
     # 残りを処理する
     process_batch(True)
