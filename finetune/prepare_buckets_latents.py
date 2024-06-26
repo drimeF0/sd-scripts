@@ -21,6 +21,7 @@ import library.train_util as train_util
 from library.utils import setup_logging
 setup_logging()
 import logging
+logging.basicConfig(force=True)
 logger = logging.getLogger(__name__)
 
 
