@@ -219,7 +219,8 @@ def train(args):
             raise "please specify training batch size in argument '--hivemind_batch_size_per_step'"
         accelerator.print("Enabling hivemind decentralized training")
         import hivemind
-        dht = hivemind.DHT(start=True,initial_peers=args.hivemind_peers)
+        initial_peers = args.hivemind_peers.split() if args.hivemind_peers else None
+        dht = hivemind.DHT(start=True,initial_peers=initial_peers)
         optimizer = hivemind.Optimizer(
             dht=dht,
             run_id=args.hivemind_run_id, 
