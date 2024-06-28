@@ -214,6 +214,24 @@ def train(args):
     accelerator.print("prepare optimizer, data loader etc.")
     _, _, optimizer = train_util.get_optimizer(args, trainable_params=trainable_params)
 
+    if args.hivemind:
+        if not args.hivemind_batch_size_per_step:
+            raise "please specify training batch size in argument '--hivemind_batch_size_per_step'"
+        accelerator.print("Enabling hivemind decentralized training")
+        import hivemind
+        dht = hivemind.DHT(start=True,initial_peers=args.hivemind_peers)
+        optimizer = hivemind.Optimizer(
+            dht=dht,
+            run_id=args.hivemind_run_id, 
+            batch_size_per_step=args.hivemind_batch_size_per_step, 
+            target_batch_size=args.hivemind_target_batch_size,
+            optimizer=optimizer,
+            use_local_updates=True,
+            matchmaking_time=30.0,     # when averaging parameters, gather peers in background for up to this many seconds
+            averaging_timeout=60.0,   # give up on averaging if not successful in this many seconds
+            verbose=True              # print logs incessently
+        )
+
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
     n_workers = min(args.max_data_loader_n_workers, os.cpu_count())  # cpu_count or max_data_loader_n_workers
@@ -511,6 +529,34 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_half_vae",
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
+    )
+
+    parser.add_argument(
+        "--hivemind",
+        action="store_true",
+        help="enable hive mind. if enabled, please specify training batch size in argument '--hivemind_batch_size_per_step'",
+    )
+
+    parser.add_argument(
+        "--hivemind_peers", type=str, default=None, help="hivemind DHT input peers"
+    )
+
+    parser.add_argument(
+        "--hivemind_run_id", type=str, default="kohya_run", help="unique identifier of this collaborative run"
+    )
+
+    parser.add_argument(
+        "--hivemind_batch_size_per_step",
+        type=int,
+        default=0,
+        help="each call to optimizer.step adds this many samples towards the next epoch",
+    )
+
+    parser.add_argument(
+        "--hivemind_target_batch_size",
+        type=int,
+        default=32,
+        help="after peers collectively process this many samples, average weights and begin the next epoch "
     )
 
     return parser
