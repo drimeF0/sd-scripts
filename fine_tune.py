@@ -213,6 +213,7 @@ def train(args):
     # 学習に必要なクラスを準備する
     accelerator.print("prepare optimizer, data loader etc.")
     _, _, optimizer = train_util.get_optimizer(args, trainable_params=trainable_params)
+    lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     if args.hivemind:
         if not args.hivemind_batch_size_per_step:
@@ -229,6 +230,7 @@ def train(args):
             averager_opts={"initialize_optimizer":False}, #maybe fix
             optimizer=optimizer,
             use_local_updates=True,
+            scheduler=lr_scheduler,
             matchmaking_time=30.0,     # when averaging parameters, gather peers in background for up to this many seconds
             averaging_timeout=60.0,   # give up on averaging if not successful in this many seconds
             verbose=True              # print logs incessently
@@ -258,8 +260,6 @@ def train(args):
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-    # lr schedulerを用意する
-    lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     # 実験的機能：勾配も含めたfp16学習を行う　モデル全体をfp16にする
     if args.full_fp16:
