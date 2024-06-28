@@ -226,6 +226,7 @@ def train(args):
             run_id=args.hivemind_run_id, 
             batch_size_per_step=args.hivemind_batch_size_per_step, 
             target_batch_size=args.hivemind_target_batch_size,
+            averager_opts={"initialize_optimizer":False}, #maybe fix
             optimizer=optimizer,
             use_local_updates=True,
             matchmaking_time=30.0,     # when averaging parameters, gather peers in background for up to this many seconds
