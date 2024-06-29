@@ -216,25 +216,9 @@ def train(args):
     lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     if args.hivemind:
-        if not args.hivemind_batch_size_per_step:
-            raise "please specify training batch size in argument '--hivemind_batch_size_per_step'"
         accelerator.print("Enabling hivemind decentralized training")
-        import hivemind
-        initial_peers = args.hivemind_peers.split() if args.hivemind_peers else None
-        dht = hivemind.DHT(start=True,initial_peers=initial_peers)
-        optimizer = hivemind.Optimizer(
-            dht=dht,
-            run_id=args.hivemind_run_id, 
-            batch_size_per_step=args.hivemind_batch_size_per_step, 
-            target_batch_size=args.hivemind_target_batch_size,
-            averager_opts={"initialize_optimizer":False}, #maybe fix
-            optimizer=optimizer,
-            use_local_updates=True,
-            scheduler=lr_scheduler,
-            matchmaking_time=30.0,     # when averaging parameters, gather peers in background for up to this many seconds
-            averaging_timeout=60.0,   # give up on averaging if not successful in this many seconds
-            verbose=True              # print logs incessently
-        )
+        train_util.enable_hivemind(args, optimizer, lr_scheduler)
+
 
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
@@ -516,6 +500,7 @@ def setup_parser() -> argparse.ArgumentParser:
     train_util.add_optimizer_arguments(parser)
     config_util.add_config_arguments(parser)
     custom_train_functions.add_custom_train_arguments(parser)
+    train_util.add_hivemind_arguments(parser)
 
     parser.add_argument(
         "--diffusers_xformers", action="store_true", help="use xformers by diffusers / Diffusersでxformersを使用する"
@@ -532,34 +517,7 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
-
-    parser.add_argument(
-        "--hivemind",
-        action="store_true",
-        help="enable hive mind. if enabled, please specify training batch size in argument '--hivemind_batch_size_per_step'",
-    )
-
-    parser.add_argument(
-        "--hivemind_peers", type=str, default=None, help="hivemind DHT input peers"
-    )
-
-    parser.add_argument(
-        "--hivemind_run_id", type=str, default="kohya_run", help="unique identifier of this collaborative run"
-    )
-
-    parser.add_argument(
-        "--hivemind_batch_size_per_step",
-        type=int,
-        default=0,
-        help="each call to optimizer.step adds this many samples towards the next epoch",
-    )
-
-    parser.add_argument(
-        "--hivemind_target_batch_size",
-        type=int,
-        default=32,
-        help="after peers collectively process this many samples, average weights and begin the next epoch "
-    )
+    
 
     return parser
 

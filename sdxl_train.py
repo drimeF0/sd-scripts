@@ -356,6 +356,13 @@ def train(args):
     # 学習に必要なクラスを準備する
     accelerator.print("prepare optimizer, data loader etc.")
     _, _, optimizer = train_util.get_optimizer(args, trainable_params=params_to_optimize)
+    lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
+    
+    if args.hivemind:
+        accelerator.print("Enabling hivemind decentralized training")
+        train_util.enable_hivemind(args, optimizer, lr_scheduler)
+
+
 
     # dataloaderを準備する
     # DataLoaderのプロセス数：0 は persistent_workers が使えないので注意
@@ -381,8 +388,6 @@ def train(args):
     # データセット側にも学習ステップを送信
     train_dataset_group.set_max_train_steps(args.max_train_steps)
 
-    # lr schedulerを用意する
-    lr_scheduler = train_util.get_scheduler_fix(args, optimizer, accelerator.num_processes)
 
     # 実験的機能：勾配も含めたfp16/bf16学習を行う　モデル全体をfp16/bf16にする
     if args.full_fp16:

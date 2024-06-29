@@ -3378,6 +3378,34 @@ def add_masked_loss_arguments(parser: argparse.ArgumentParser):
         help="apply mask for calculating loss. conditioning_data_dir is required for dataset. / 損失計算時にマスクを適用する。datasetにはconditioning_data_dirが必要",
     )
 
+def add_hivemind_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+    "--hivemind",
+    action="store_true",
+    help="enable hive mind. if enabled, please specify training batch size in argument '--hivemind_batch_size_per_step'",
+)
+
+    parser.add_argument(
+        "--hivemind_peers", type=str, default=None, help="hivemind DHT input peers"
+    )
+
+    parser.add_argument(
+        "--hivemind_run_id", type=str, default="kohya_run", help="unique identifier of this collaborative run"
+    )
+
+    parser.add_argument(
+        "--hivemind_batch_size_per_step",
+        type=int,
+        default=0,
+        help="each call to optimizer.step adds this many samples towards the next epoch",
+    )
+
+    parser.add_argument(
+        "--hivemind_target_batch_size",
+        type=int,
+        default=32,
+        help="after peers collectively process this many samples, average weights and begin the next epoch "
+    )
 
 # verify command line args for training
 def verify_command_line_training_args(args: argparse.Namespace):
@@ -5328,6 +5356,30 @@ def sample_image_inference(
         wandb_tracker.log({f"sample_{i}": wandb.Image(image)})
     except:  # wandb 無効時
         pass
+
+
+
+def enable_hivemind(args, optimizer, lr_scheduler):
+    import hivemind
+    if not args.hivemind_batch_size_per_step:
+        raise ValueError("please specify training batch size in argument '--hivemind_batch_size_per_step'")
+    initial_peers = args.hivemind_peers.split() if args.hivemind_peers else None
+    dht = hivemind.DHT(start=True,initial_peers=initial_peers)
+    
+    optimizer = hivemind.Optimizer(
+        dht=dht,
+        run_id=args.hivemind_run_id, 
+        batch_size_per_step=args.hivemind_batch_size_per_step, 
+        target_batch_size=args.hivemind_target_batch_size,
+        averager_opts={"initialize_optimizer":False}, #maybe fix
+        optimizer=optimizer,
+        use_local_updates=True,
+        scheduler=lr_scheduler,
+        matchmaking_time=30.0,     # when averaging parameters, gather peers in background for up to this many seconds
+        averaging_timeout=60.0,   # give up on averaging if not successful in this many seconds
+        verbose=True              # print logs incessently
+    )
+    return optimizer
 
 
 # endregion
