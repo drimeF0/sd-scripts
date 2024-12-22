@@ -5,6 +5,11 @@ This repository contains training, generation and utility scripts for Stable Dif
 
 [日本語版READMEはこちら](./README-ja.md)
 
+The development version is in the `dev` branch. Please check the dev branch for the latest changes.
+
+FLUX.1 and SD3/SD3.5 support is done in the `sd3` branch. If you want to train them, please use the sd3 branch.
+
+
 For easier use (GUI and PowerShell scripts etc...), please visit [the repository maintained by bmaltais](https://github.com/bmaltais/kohya_ss). Thanks to @bmaltais!
 
 This repository contains the scripts for:
@@ -136,6 +141,41 @@ The majority of scripts is licensed under ASL 2.0 (including codes from Diffuser
 
 
 ## Change History
+
+### Oct 27, 2024 / 2024-10-27:
+
+- `svd_merge_lora.py` VRAM usage has been reduced. However, main memory usage will increase (32GB is sufficient).
+- This will be included in the next release.
+- `svd_merge_lora.py` のVRAM使用量を削減しました。ただし、メインメモリの使用量は増加します（32GBあれば十分です）。
+- これは次回リリースに含まれます。
+
+### Oct 26, 2024 / 2024-10-26: 
+
+- Fixed a bug in `svd_merge_lora.py`, `sdxl_merge_lora.py`, and `resize_lora.py` where the hash value of LoRA metadata was not correctly calculated when the `save_precision` was different from the  `precision` used in the calculation. See issue [#1722](https://github.com/kohya-ss/sd-scripts/pull/1722) for details. Thanks to JujoHotaru for raising the issue.
+- It will be included in the next release.
+
+- `svd_merge_lora.py`、`sdxl_merge_lora.py`、`resize_lora.py`で、保存時の精度が計算時の精度と異なる場合、LoRAメタデータのハッシュ値が正しく計算されない不具合を修正しました。詳細は issue [#1722](https://github.com/kohya-ss/sd-scripts/pull/1722) をご覧ください。問題提起していただいた JujoHotaru 氏に感謝します。
+- 以上は次回リリースに含まれます。
+
+### Sep 13, 2024 / 2024-09-13: 
+
+- `sdxl_merge_lora.py` now supports OFT. Thanks to Maru-mee for the PR [#1580](https://github.com/kohya-ss/sd-scripts/pull/1580). 
+- `svd_merge_lora.py` now supports LBW. Thanks to terracottahaniwa. See PR [#1575](https://github.com/kohya-ss/sd-scripts/pull/1575) for details.
+- `sdxl_merge_lora.py` also supports LBW. 
+- See [LoRA Block Weight](https://github.com/hako-mikan/sd-webui-lora-block-weight) by hako-mikan for details on LBW.
+- These will be included in the next release.
+
+- `sdxl_merge_lora.py` が OFT をサポートされました。PR [#1580](https://github.com/kohya-ss/sd-scripts/pull/1580) Maru-mee 氏に感謝します。
+- `svd_merge_lora.py` で LBW がサポートされました。PR [#1575](https://github.com/kohya-ss/sd-scripts/pull/1575) terracottahaniwa 氏に感謝します。
+- `sdxl_merge_lora.py` でも LBW がサポートされました。
+- LBW の詳細は hako-mikan 氏の [LoRA Block Weight](https://github.com/hako-mikan/sd-webui-lora-block-weight) をご覧ください。
+- 以上は次回リリースに含まれます。
+
+### Jun 23, 2024 / 2024-06-23: 
+
+- Fixed `cache_latents.py` and `cache_text_encoder_outputs.py` not working. (Will be included in the next release.)
+
+- `cache_latents.py` および `cache_text_encoder_outputs.py` が動作しなくなっていたのを修正しました。（次回リリースに含まれます。）
 
 ### Apr 7, 2024 / 2024-04-07: v0.8.7
 
