@@ -51,7 +51,8 @@ from library.custom_train_functions import apply_masked_loss, add_custom_train_a
 #     apply_masked_loss,
 # )
 
-
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
 def train(args):
     train_util.verify_training_args(args)
     train_util.prepare_dataset_args(args, True)
