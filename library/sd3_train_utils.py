@@ -531,6 +531,7 @@ def sample_image_inference(
         if sample_prompts_te_outputs and prpt in sample_prompts_te_outputs:
             text_encoder_conds = sample_prompts_te_outputs[prpt]
             print(f"Using cached text encoder outputs for prompt: {prpt}")
+            return text_encoder_conds
         if text_encoders is not None:
             print(f"Encoding prompt: {prpt}")
             tokens_and_masks = tokenize_strategy.tokenize(prpt)
