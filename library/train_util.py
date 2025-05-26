@@ -4167,7 +4167,7 @@ def get_optimizer(args, trainable_params: List[Dict[str, Any]]) -> Tuple[str, st
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
     
-    elif optimizer_type.startswith("apollo"):
+    elif optimizer_type.startswith("apollo") or optimizer_type.startswith("qapollo"):
         optimizer_class = _get_apollo_optimizer_class(optimizer_type)
         low_rank_params, full_rank_params = [], []
 
