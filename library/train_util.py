@@ -4215,7 +4215,7 @@ def _get_apollo_optimizer_class(optimizer_type: str) -> torch.optim.Optimizer:
     except ImportError:
         raise ImportError("apollo_torch is not installed.")
     optimizer_classes = {
-        "apollOadamw": APOLLOAdamW,
+        "apolloadamw": APOLLOAdamW,
         "qapolloadamw": QAPOLLOAdamW,
     }
 
