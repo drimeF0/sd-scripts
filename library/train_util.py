@@ -4178,7 +4178,7 @@ def get_optimizer(args, trainable_params: List[Dict[str, Any]]) -> Tuple[str, st
                 low_rank_params.append(param)
         optimizer_trainable_params = [
             {"params":full_rank_params,},
-            {"params":low_rank_params, "rank": 32, "proj": "random", "scale_type": "channel", "scale": 1, "update_proj_gap": 200, "proj_type": "std"},
+            {"params":low_rank_params, "rank": 128, "proj": "random", "scale_type": "channel", "scale": 1, "update_proj_gap": 200, "proj_type": "std"},
         ]
         optimizer = optimizer_class(optimizer_trainable_params, lr=lr)
 
@@ -4208,12 +4208,21 @@ def _parse_optimizer_args(optimizer_args: Optional[List[str]]) -> Dict[str, Any]
             optimizer_kwargs[key] = ast.literal_eval(value)
     return optimizer_kwargs
 
-def _get_apollo_optimizer_class() -> torch.optim.Optimizer:
+def _get_apollo_optimizer_class(optimizer_type: str) -> torch.optim.Optimizer:
 
     try:
-        from apollo_torch import APOLLOAdamW
+        from apollo_torch import APOLLOAdamW, QAPOLLOAdamW
     except ImportError:
         raise ImportError("apollo_torch is not installed.")
+    optimizer_classes = {
+        "apollOadamw": APOLLOAdamW,
+        "qapolloadamw": QAPOLLOAdamW,
+    }
+
+    if optimizer_type not in optimizer_classes:
+        raise ValueError(f"Unknown 8-bit optimizer type: {optimizer_type}")
+
+    return optimizer_classes[optimizer_type]
 
 def _get_lion_optimizer_class() -> torch.optim.Optimizer:
     """
