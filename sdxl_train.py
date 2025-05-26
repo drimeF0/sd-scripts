@@ -539,8 +539,8 @@ def train(args):
                     if parameter.requires_grad:
 
                         def optimizer_hook(parameter: torch.Tensor):
-                            if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                                accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
+                            # if accelerator.sync_gradients and args.max_grad_norm != 0.0:
+                            #     accelerator.clip_grad_norm_(parameter, args.max_grad_norm)
 
                             i = parameter_optimizer_map[parameter]
                             optimizer_hooked_count[i] += 1
@@ -742,10 +742,11 @@ def train(args):
 
                 if not (args.fused_backward_pass or args.fused_optimizer_groups):
                     if accelerator.sync_gradients and args.max_grad_norm != 0.0:
-                        params_to_clip = []
-                        for m in training_models:
-                            params_to_clip.extend(m.parameters())
-                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                        pass
+                        # params_to_clip = []
+                        # for m in training_models:
+                        #     params_to_clip.extend(m.parameters())
+                        #accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                     optimizer.step()
                     lr_scheduler.step()
