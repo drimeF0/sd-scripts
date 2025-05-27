@@ -48,6 +48,9 @@ from library.sdxl_original_unet import SdxlUNet2DConditionModel
 
 UNET_NUM_BLOCKS_FOR_BLOCK_LR = 23
 
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
+
 
 def get_block_params_to_optimize(unet: SdxlUNet2DConditionModel, block_lrs: List[float]) -> List[dict]:
     block_params = [[] for _ in range(len(block_lrs))]
@@ -483,9 +486,13 @@ def train(args):
 
     # TextEncoderの出力をキャッシュするときにはCPUへ移動する
     if args.cache_text_encoder_outputs:
+        del text_encoder1
+        del text_encoder2
+        text_encoder1 = None
+        text_encoder2 = None
         # move Text Encoders for sampling images. Text Encoder doesn't work on CPU with fp16
-        text_encoder1.to("cpu", dtype=torch.float32)
-        text_encoder2.to("cpu", dtype=torch.float32)
+        # text_encoder1.to("cpu", dtype=torch.float32)
+        # text_encoder2.to("cpu", dtype=torch.float32)
         clean_memory_on_device(accelerator.device)
     else:
         # make sure Text Encoders are on GPU
