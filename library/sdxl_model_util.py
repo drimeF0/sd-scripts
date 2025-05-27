@@ -490,21 +490,21 @@ def save_stable_diffusion_checkpoint(
     save_dtype=None,
 ):
 
-    def update_sd(prefix, state_dict):
+    def update_sd(prefix, model_state_dict):
         state_dict = {}
         keys_count = 0
-        for k, v in state_dict.items():
+        for k, v in model_state_dict.items():
             key = prefix + k
             keys_count += 1
             # if save_dtype is not None:
             #     v = v.detach().clone().to("cpu").to(save_dtype)
             state_dict[key] = v
-            output_file_without_ext, output_file_ext = output_file.split(".", 1)
-            new_output_file = f"{output_file_without_ext}{prefix}.{output_file_ext}"
-            if model_util.is_safetensors(output_file):
-                save_file(state_dict, output_file, metadata)
-            else:
-                raise NotImplementedError("Only safetensors is supported for now.")
+        output_file_without_ext, output_file_ext = output_file.split(".", 1)
+        new_output_file = f"{output_file_without_ext}{prefix}{output_file_ext}"
+        if model_util.is_safetensors(new_output_file):
+            save_file(state_dict, new_output_file, metadata)
+        else:
+            raise NotImplementedError("Only safetensors is supported for now.")
         return keys_count
         
     key_count = 0
