@@ -489,44 +489,37 @@ def save_stable_diffusion_checkpoint(
     metadata,
     save_dtype=None,
 ):
-    state_dict = {}
 
-    def update_sd(prefix, sd):
-        for k, v in sd.items():
+    def update_sd(prefix, state_dict):
+        state_dict = {}
+        keys_count = 0
+        for k, v in state_dict.items():
             key = prefix + k
-            if save_dtype is not None:
-                v = v.detach().clone().to("cpu").to(save_dtype)
+            keys_count += 1
+            # if save_dtype is not None:
+            #     v = v.detach().clone().to("cpu").to(save_dtype)
             state_dict[key] = v
-
+            output_file_without_ext, output_file_ext = output_file.split(".", 1)
+            new_output_file = f"{output_file_without_ext}{prefix}.{output_file_ext}"
+            if model_util.is_safetensors(output_file):
+                save_file(state_dict, output_file, metadata)
+            else:
+                raise NotImplementedError("Only safetensors is supported for now.")
+        return keys_count
+        
+    key_count = 0
     # Convert the UNet model
-    update_sd("model.diffusion_model.", unet.state_dict())
+    key_count = key_count + update_sd("model.diffusion_model.", unet.state_dict())
 
     # Convert the text encoders
-    update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
+    key_count = key_count + update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
 
     text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
-    update_sd("conditioner.embedders.1.model.", text_enc2_dict)
+    key_count = key_count + update_sd("conditioner.embedders.1.model.", text_enc2_dict)
 
     # Convert the VAE
     vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
-    update_sd("first_stage_model.", vae_dict)
-
-    # Put together new checkpoint
-    key_count = len(state_dict.keys())
-    new_ckpt = {"state_dict": state_dict}
-
-    # epoch and global_step are sometimes not int
-    if ckpt_info is not None:
-        epochs += ckpt_info[0]
-        steps += ckpt_info[1]
-
-    new_ckpt["epoch"] = epochs
-    new_ckpt["global_step"] = steps
-
-    if model_util.is_safetensors(output_file):
-        save_file(state_dict, output_file, metadata)
-    else:
-        torch.save(new_ckpt, output_file)
+    key_count = key_count + update_sd("first_stage_model.", vae_dict)
 
     return key_count
 
