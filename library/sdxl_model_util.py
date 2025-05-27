@@ -494,15 +494,15 @@ def save_stable_diffusion_checkpoint(
         state_dict = {}
         keys_count = 0
         for k, v in model_state_dict.items():
-            key = prefix + k
+            # key = prefix + k
             keys_count += 1
             # if save_dtype is not None:
             #     v = v.detach().clone().to("cpu").to(save_dtype)
-            state_dict[key] = v
+            # state_dict[key] = v
         output_file_without_ext, output_file_ext = output_file.split(".", 1)
         new_output_file = f"{output_file_without_ext}{prefix}{output_file_ext}"
         if model_util.is_safetensors(new_output_file):
-            save_file(state_dict, new_output_file, metadata)
+            save_file(model_state_dict, new_output_file, metadata)
         else:
             raise NotImplementedError("Only safetensors is supported for now.")
         return keys_count
@@ -512,14 +512,14 @@ def save_stable_diffusion_checkpoint(
     key_count = key_count + update_sd("model.diffusion_model.", unet.state_dict())
 
     # Convert the text encoders
-    key_count = key_count + update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
+    #key_count = key_count + update_sd("conditioner.embedders.0.transformer.", text_encoder1.state_dict())
 
-    text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
-    key_count = key_count + update_sd("conditioner.embedders.1.model.", text_enc2_dict)
+    #text_enc2_dict = convert_text_encoder_2_state_dict_to_sdxl(text_encoder2.state_dict(), logit_scale)
+    #key_count = key_count + update_sd("conditioner.embedders.1.model.", text_enc2_dict)
 
     # Convert the VAE
-    vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
-    key_count = key_count + update_sd("first_stage_model.", vae_dict)
+    #vae_dict = model_util.convert_vae_state_dict(vae.state_dict())
+    #key_count = key_count + update_sd("first_stage_model.", vae_dict)
 
     return key_count
 
