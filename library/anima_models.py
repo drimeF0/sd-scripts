@@ -1,5 +1,6 @@
 # Anima Model Architecture
 # Original code: NVIDIA CORPORATION & AFFILIATES, licensed under Apache-2.0
+# Modified: recursive architecture + multi-GPU block offloading support
 
 import math
 from typing import Any, Optional, Tuple, Union
@@ -445,7 +446,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
 
         self.seq = torch.arange(max(self.max_h, self.max_w, self.max_t)).float().to(self.dim_spatial_range.device)
         self.dim_spatial_range = torch.arange(0, dim_h, 2)[: (dim_h // 2)].float().to(self.dim_spatial_range.device) / dim_h
-        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().to(self.dim_spatial_range.device) / dim_t
+        self.dim_temporal_range = torch.arange(0, dim_t, 2)[: (dim_t // 2)].float().to(self.dim_temporal_range.device) / dim_t
 
     def generate_embeddings(
         self,
@@ -618,32 +619,6 @@ class TimestepEmbedding(nn.Module):
             emb_B_T_D = emb
 
         return emb_B_T_D, adaln_lora_B_T_3D
-
-
-# Commented out Fourier Features (not used in Anima). Kept for reference.
-# class FourierFeatures(nn.Module):
-#     """Fourier feature transform: [B] -> [B, D]."""
-
-#     def __init__(self, num_channels: int, bandwidth: int = 1, normalize: bool = False):
-#         super().__init__()
-#         self.register_buffer("freqs", 2 * np.pi * bandwidth * torch.randn(num_channels), persistent=True)
-#         self.register_buffer("phases", 2 * np.pi * torch.rand(num_channels), persistent=True)
-#         self.gain = np.sqrt(2) if normalize else 1
-#         self.bandwidth = bandwidth
-#         self.num_channels = num_channels
-#         self.reset_parameters()
-
-#     def reset_parameters(self) -> None:
-#         generator = torch.Generator()
-#         generator.manual_seed(0)
-#         self.freqs = 2 * np.pi * self.bandwidth * torch.randn(self.num_channels, generator=generator).to(self.freqs.device)
-#         self.phases = 2 * np.pi * torch.rand(self.num_channels, generator=generator).to(self.freqs.device)
-
-#     def forward(self, x: torch.Tensor, gain: float = 1.0) -> torch.Tensor:
-#         in_dtype = x.dtype
-#         x = x.to(torch.float32).ger(self.freqs.to(torch.float32)).add(self.phases.to(torch.float32))
-#         x = x.cos().mul(self.gain * gain).to(in_dtype)
-#         return x
 
 
 # Patch Embedding
@@ -1034,6 +1009,15 @@ class Anima(nn.Module):
     """Cosmos-Predict2 DiT model for image/video generation.
 
     28 transformer blocks with AdaLN-LoRA modulation, 3D RoPE, and optional LLM Adapter.
+
+    Extended with:
+    - Recursive architecture: the block loop can be executed multiple times (num_recursions).
+      Default is 1 (original behavior). Set num_recursions > 1 to pass hidden states
+      through the same block stack repeatedly, sharing weights across recursions.
+    - Multi-GPU block offloading: the last `num_blocks_on_gpu2` blocks can be placed on
+      a second GPU (gpu2_device). Hidden states are transferred to the second GPU before
+      processing those blocks and back to the primary GPU afterward. Default is 0
+      (all blocks on the primary GPU).
     """
 
     LATENT_CHANNELS = 16
@@ -1071,6 +1055,9 @@ class Anima(nn.Module):
         use_llm_adapter: bool = False,
         attn_mode: str = "torch",
         split_attn: bool = False,
+        # --- NEW PARAMETERS ---
+        num_recursions: int = 1,
+        num_blocks_on_gpu2: int = 0,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1102,7 +1089,22 @@ class Anima(nn.Module):
         self.attn_mode = attn_mode
         self.split_attn = split_attn
 
-        # Block swap support
+        # --- NEW: Recursive architecture ---
+        assert num_recursions >= 1, f"num_recursions must be >= 1, got {num_recursions}"
+        self.num_recursions = num_recursions
+
+        # --- NEW: Multi-GPU block offloading ---
+        assert num_blocks_on_gpu2 >= 0, f"num_blocks_on_gpu2 must be >= 0, got {num_blocks_on_gpu2}"
+        assert num_blocks_on_gpu2 <= num_blocks, (
+            f"num_blocks_on_gpu2 ({num_blocks_on_gpu2}) must be <= num_blocks ({num_blocks})"
+        )
+        self.num_blocks_on_gpu2 = num_blocks_on_gpu2
+        # gpu2_device is set later via set_gpu2_device(); None means "not configured yet"
+        self.gpu2_device: Optional[torch.device] = None
+        # The index at which blocks start being on GPU2 (last num_blocks_on_gpu2 blocks)
+        self.gpu2_block_start_idx = num_blocks - num_blocks_on_gpu2 if num_blocks_on_gpu2 > 0 else num_blocks
+
+        # Block swap support (original)
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
 
@@ -1251,6 +1253,48 @@ class Anima(nn.Module):
         )
         return x_B_C_Tt_Hp_Wp
 
+    # -----------------------------------------------------------------
+    # Multi-GPU2 block offloading helpers
+    # -----------------------------------------------------------------
+
+    def set_gpu2_device(self, device: Union[torch.device, str, int]) -> None:
+        """Set the second GPU device and move the designated blocks onto it.
+
+        Args:
+            device: The second GPU device (e.g. ``torch.device("cuda:1")``,
+                     ``"cuda:1"``, or ``1``).
+        """
+        if isinstance(device, int):
+            device = torch.device(f"cuda:{device}")
+        elif isinstance(device, str):
+            device = torch.device(device)
+
+        self.gpu2_device = device
+
+        if self.num_blocks_on_gpu2 > 0:
+            for block_idx in range(self.gpu2_block_start_idx, self.num_blocks):
+                self.blocks[block_idx].to(device)
+            logger.info(
+                f"Anima: Moved blocks [{self.gpu2_block_start_idx}..{self.num_blocks - 1}] "
+                f"({self.num_blocks_on_gpu2} blocks) to {device}."
+            )
+
+    def _get_block_device(self, block_idx: int) -> Optional[torch.device]:
+        """Return the device on which a given block *should* reside.
+
+        Returns ``None`` when GPU2 offloading is not configured (i.e. all blocks
+        are on the primary device and no cross-device transfers are needed).
+        """
+        if self.num_blocks_on_gpu2 <= 0 or self.gpu2_device is None:
+            return None
+        if block_idx >= self.gpu2_block_start_idx:
+            return self.gpu2_device
+        return None
+
+    # -----------------------------------------------------------------
+    # Block swap support (original, unmodified)
+    # -----------------------------------------------------------------
+
     def enable_block_swap(self, num_blocks: int, device: torch.device):
         self.blocks_to_swap = num_blocks
 
@@ -1290,6 +1334,10 @@ class Anima(nn.Module):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:
             return
         self.offloader.prepare_block_devices_before_forward(self.blocks)
+
+    # -----------------------------------------------------------------
+    # Main forward pass
+    # -----------------------------------------------------------------
 
     def forward_mini_train_dit(
         self,
@@ -1346,15 +1394,59 @@ class Anima(nn.Module):
         # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
         use_fp32 = x_B_T_H_W_D.dtype == torch.float16
 
-        for block_idx, block in enumerate(self.blocks):
-            if self.blocks_to_swap:
-                self.offloader.wait_for_block(block_idx)
+        # Remember the primary device for cross-GPU transfers
+        primary_device = x_B_T_H_W_D.device
 
-            x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
+        # =====================================================================
+        # RECURSIVE ARCHITECTURE: iterate through all blocks num_recursions times.
+        # The same blocks are reused (weight-shared) across recursions.
+        # With num_recursions=1 this is identical to the original single pass.
+        # =====================================================================
+        for recursion_idx in range(self.num_recursions):
+            for block_idx, block in enumerate(self.blocks):
+                # --- Block swap support (original) ---
+                if self.blocks_to_swap:
+                    self.offloader.wait_for_block(block_idx)
 
-            if self.blocks_to_swap:
-                self.offloader.submit_move_blocks(self.blocks, block_idx)
+                # --- Multi-GPU2 offloading: transfer hidden states if needed ---
+                target_device = self._get_block_device(block_idx)
+                if target_device is not None:
+                    x_B_T_H_W_D = x_B_T_H_W_D.to(target_device)
+                    # Also move crossattn_emb and t_embedding if they are needed on GPU2
+                    # for the cross-attention and AdaLN modulation respectively.
+                    # We save the originals on primary device and restore after the block.
+                    _crossattn_on_gpu2 = crossattn_emb.to(target_device)
+                    _temb_on_gpu2 = t_embedding_B_T_D.to(target_device)
+                    # Move rope_emb and adaln_lora if present
+                    _rope_on_gpu2 = rope_emb_L_1_1_D.to(target_device) if rope_emb_L_1_1_D is not None else None
+                    _adaln_on_gpu2 = adaln_lora_B_T_3D.to(target_device) if adaln_lora_B_T_3D is not None else None
+                    _extra_pos_on_gpu2 = extra_pos_emb.to(target_device) if extra_pos_emb is not None else None
 
+                    gpu2_block_kwargs = {
+                        "rope_emb_L_1_1_D": _rope_on_gpu2,
+                        "adaln_lora_B_T_3D": _adaln_on_gpu2,
+                        "extra_per_block_pos_emb": _extra_pos_on_gpu2,
+                    }
+
+                    x_B_T_H_W_D = block(
+                        x_B_T_H_W_D, _temb_on_gpu2, _crossattn_on_gpu2, attn_params, use_fp32, **gpu2_block_kwargs
+                    )
+
+                    # Move result back to primary device
+                    x_B_T_H_W_D = x_B_T_H_W_D.to(primary_device)
+                else:
+                    # Block is on the primary device — normal path
+                    x_B_T_H_W_D = block(
+                        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs
+                    )
+
+                # --- Block swap support (original) ---
+                if self.blocks_to_swap:
+                    self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        # =====================================================================
+        # Final layer (always on primary device)
+        # =====================================================================
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         return x_B_C_Tt_Hp_Wp
@@ -1560,7 +1652,7 @@ class LLMAdapterTransformerBlock(nn.Module):
 
 
 class LLMAdapter(nn.Module):
-    """Bridge module: Qwen3 embeddings (source) → T5-compatible space (target).
+    """Bridge module: Qwen3 embeddings (source) -> T5-compatible space (target).
 
     Uses T5 token IDs as target input, embeds them, and cross-attends to Qwen3 hidden states.
     """
@@ -1614,58 +1706,3 @@ class LLMAdapter(nn.Module):
                 position_embeddings_context=position_embeddings_context,
             )
         return self.norm(self.out_proj(x))
-
-
-# Not used currently, but kept for reference
-
-# def get_dit_config(state_dict, key_prefix=""):
-#     """Derive DiT configuration from state_dict weight shapes."""
-#     dit_config = {}
-#     dit_config["max_img_h"] = 512
-#     dit_config["max_img_w"] = 512
-#     dit_config["max_frames"] = 128
-#     concat_padding_mask = True
-#     dit_config["in_channels"] = (state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[1] // 4) - int(
-#         concat_padding_mask
-#     )
-#     dit_config["out_channels"] = 16
-#     dit_config["patch_spatial"] = 2
-#     dit_config["patch_temporal"] = 1
-#     dit_config["model_channels"] = state_dict["{}x_embedder.proj.1.weight".format(key_prefix)].shape[0]
-#     dit_config["concat_padding_mask"] = concat_padding_mask
-#     dit_config["crossattn_emb_channels"] = 1024
-#     dit_config["pos_emb_cls"] = "rope3d"
-#     dit_config["pos_emb_learnable"] = True
-#     dit_config["pos_emb_interpolation"] = "crop"
-#     dit_config["min_fps"] = 1
-#     dit_config["max_fps"] = 30
-
-#     dit_config["use_adaln_lora"] = True
-#     dit_config["adaln_lora_dim"] = 256
-#     if dit_config["model_channels"] == 2048:
-#         dit_config["num_blocks"] = 28
-#         dit_config["num_heads"] = 16
-#     elif dit_config["model_channels"] == 5120:
-#         dit_config["num_blocks"] = 36
-#         dit_config["num_heads"] = 40
-#     elif dit_config["model_channels"] == 1280:
-#         dit_config["num_blocks"] = 20
-#         dit_config["num_heads"] = 20
-
-#     if dit_config["in_channels"] == 16:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 4.0
-#         dit_config["rope_w_extrapolation_ratio"] = 4.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-#     elif dit_config["in_channels"] == 17:
-#         dit_config["extra_per_block_abs_pos_emb"] = False
-#         dit_config["rope_h_extrapolation_ratio"] = 3.0
-#         dit_config["rope_w_extrapolation_ratio"] = 3.0
-#         dit_config["rope_t_extrapolation_ratio"] = 1.0
-
-#     dit_config["extra_h_extrapolation_ratio"] = 1.0
-#     dit_config["extra_w_extrapolation_ratio"] = 1.0
-#     dit_config["extra_t_extrapolation_ratio"] = 1.0
-#     dit_config["rope_enable_fps_modulation"] = False
-
-#     return dit_config
