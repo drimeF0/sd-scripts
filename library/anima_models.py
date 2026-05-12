@@ -1100,7 +1100,7 @@ class Anima(nn.Module):
         )
         self.num_blocks_on_gpu2 = num_blocks_on_gpu2
         # gpu2_device is set later via set_gpu2_device(); None means "not configured yet"
-        self.gpu2_device: Optional[torch.device] = "cuda:1"
+        self.gpu2_device: Optional[torch.device] = None
         # The index at which blocks start being on GPU2 (last num_blocks_on_gpu2 blocks)
         self.gpu2_block_start_idx = num_blocks - num_blocks_on_gpu2 if num_blocks_on_gpu2 > 0 else num_blocks
 
@@ -1151,6 +1151,8 @@ class Anima(nn.Module):
 
         self.t_embedding_norm = RMSNorm(model_channels, eps=1e-6)
         self.init_weights()
+
+        self.set_gpu2_device("cuda:1")
 
     def init_weights(self) -> None:
         self.x_embedder.init_weights()
