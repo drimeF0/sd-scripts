@@ -29,6 +29,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
 
 class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def __init__(self):
