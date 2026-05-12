@@ -38,7 +38,8 @@ from library.config_util import (
     BlueprintGenerator,
 )
 from library.custom_train_functions import apply_masked_loss, add_custom_train_arguments
-
+import logging
+logging.basicConfig(level=logging.INFO, force=True)
 
 def train(args):
     train_util.verify_training_args(args)
