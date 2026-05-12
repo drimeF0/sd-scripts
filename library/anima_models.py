@@ -1100,7 +1100,7 @@ class Anima(nn.Module):
         )
         self.num_blocks_on_gpu2 = num_blocks_on_gpu2
         # gpu2_device is set later via set_gpu2_device(); None means "not configured yet"
-        self.gpu2_device: Optional[torch.device] = None
+        self.gpu2_device: Optional[torch.device] = "cuda:1"
         # The index at which blocks start being on GPU2 (last num_blocks_on_gpu2 blocks)
         self.gpu2_block_start_idx = num_blocks - num_blocks_on_gpu2 if num_blocks_on_gpu2 > 0 else num_blocks
 
