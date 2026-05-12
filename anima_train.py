@@ -294,6 +294,8 @@ def train(args):
     accelerator.print(f"number of training models: {len(training_models)}")
     accelerator.print(f"number of trainable parameters: {n_params:,}")
 
+    dit.set_gpu2_device("cuda:1")
+
     # prepare optimizer
     accelerator.print("prepare optimizer, data loader etc.")
 
