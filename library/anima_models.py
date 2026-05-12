@@ -1056,8 +1056,8 @@ class Anima(nn.Module):
         attn_mode: str = "torch",
         split_attn: bool = False,
         # --- NEW PARAMETERS ---
-        num_recursions: int = 1,
-        num_blocks_on_gpu2: int = 0,
+        num_recursions: int = 2,
+        num_blocks_on_gpu2: int = 12,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
