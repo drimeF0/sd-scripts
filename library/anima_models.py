@@ -1152,7 +1152,7 @@ class Anima(nn.Module):
         self.t_embedding_norm = RMSNorm(model_channels, eps=1e-6)
         self.init_weights()
 
-        self.set_gpu2_device("cuda:1")
+        
 
     def init_weights(self) -> None:
         self.x_embedder.init_weights()
