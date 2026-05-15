@@ -1151,8 +1151,8 @@ class Anima(nn.Module):
 
         self.t_embedding_norm = RMSNorm(model_channels, eps=1e-6)
 
-        # LayerNorm applied to x_B_T_H_W_D after each recursion pass
-        self.recursion_layernorm = nn.LayerNorm(model_channels)
+        # RMSNorm applied to x_B_T_H_W_D after each recursion pass
+        self.recursion_norm = RMSNorm(model_channels, eps=1e-6)
         self.init_weights()
 
         
@@ -1167,7 +1167,7 @@ class Anima(nn.Module):
             block.init_weights()
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
-        self.recursion_layernorm.reset_parameters()
+        self.recursion_norm.reset_parameters()
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         for block in self.blocks:
@@ -1451,7 +1451,7 @@ class Anima(nn.Module):
                     self.offloader.submit_move_blocks(self.blocks, block_idx)
 
             # --- Normalize hidden states after each recursion pass ---
-            x_B_T_H_W_D = self.recursion_layernorm(x_B_T_H_W_D)
+            x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
 
         # =====================================================================
         # Final layer (always on primary device)
