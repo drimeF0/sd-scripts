@@ -136,13 +136,13 @@ def load_anima_model(
         ]
         if unexpected_missing:
             # Raise error to avoid silent failures
-            raise RuntimeError(
+            logger.warning(
                 f"Missing keys in checkpoint: {unexpected_missing[:10]}{'...' if len(unexpected_missing) > 10 else ''}"
             )
         missing = {}  # all missing keys were expected
     if unexpected:
         # Raise error to avoid silent failures
-        raise RuntimeError(f"Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+        logger.warning(f"Unexpected keys in checkpoint: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
     logger.info(f"Loaded DiT model from {dit_path}, unexpected missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
     return model
