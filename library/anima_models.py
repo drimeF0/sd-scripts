@@ -1860,24 +1860,6 @@ if __name__ == "__main__":
         help="Output path for the safetensors checkpoint (default: anima_initial_checkpoint.safetensors)",
     )
     parser.add_argument(
-        "--model_channels",
-        type=int,
-        default=768,
-        help="Model hidden dimension (default: 768)",
-    )
-    parser.add_argument(
-        "--num_blocks",
-        type=int,
-        default=28,
-        help="Number of transformer blocks (default: 28)",
-    )
-    parser.add_argument(
-        "--num_heads",
-        type=int,
-        default=16,
-        help="Number of attention heads (default: 16)",
-    )
-    parser.add_argument(
         "--num_recursions",
         type=int,
         default=2,
@@ -1893,41 +1875,43 @@ if __name__ == "__main__":
 
     # Cosmos-Predict2 2B architecture defaults
     # Resolution: 480x720, max 93 frames (patched), 16 latent channels
+    dit_config = {
+        "max_img_h": 512,
+        "max_img_w": 512,
+        "max_frames": 128,
+        "in_channels": 16,
+        "out_channels": 16,
+        "patch_spatial": 2,
+        "patch_temporal": 1,
+        "model_channels": 2048,
+        "concat_padding_mask": True,
+        "crossattn_emb_channels": 1024,
+        "pos_emb_cls": "rope3d",
+        "pos_emb_learnable": True,
+        "pos_emb_interpolation": "crop",
+        "min_fps": 1,
+        "max_fps": 30,
+        "use_adaln_lora": True,
+        "adaln_lora_dim": 256,
+        "num_blocks": 28,
+        "num_heads": 16,
+        "extra_per_block_abs_pos_emb": False,
+        "rope_h_extrapolation_ratio": 4.0,
+        "rope_w_extrapolation_ratio": 4.0,
+        "rope_t_extrapolation_ratio": 1.0,
+        "extra_h_extrapolation_ratio": 1.0,
+        "extra_w_extrapolation_ratio": 1.0,
+        "extra_t_extrapolation_ratio": 1.0,
+        "rope_enable_fps_modulation": False,
+        "use_llm_adapter": True,
+        "attn_mode": "torch",
+        "split_attn": False,
+    }
     model = Anima(
-        max_img_h=480,
-        max_img_w=720,
-        max_frames=93,
-        in_channels=Anima.LATENT_CHANNELS,  # 16
-        out_channels=Anima.LATENT_CHANNELS,  # 16
-        patch_spatial=2,
-        patch_temporal=1,
-        concat_padding_mask=True,
-        model_channels=args.model_channels,
-        num_blocks=args.num_blocks,
-        num_heads=args.num_heads,
-        mlp_ratio=4.0,
-        crossattn_emb_channels=1024,
-        pos_emb_cls="rope3d",
-        pos_emb_learnable=False,
-        pos_emb_interpolation="crop",
-        min_fps=1,
-        max_fps=30,
-        use_adaln_lora=False,
-        adaln_lora_dim=256,
-        rope_h_extrapolation_ratio=1.0,
-        rope_w_extrapolation_ratio=1.0,
-        rope_t_extrapolation_ratio=1.0,
-        extra_per_block_abs_pos_emb=False,
-        extra_h_extrapolation_ratio=1.0,
-        extra_w_extrapolation_ratio=1.0,
-        extra_t_extrapolation_ratio=1.0,
-        rope_enable_fps_modulation=True,
-        use_llm_adapter=False,
-        attn_mode="torch",
-        split_attn=False,
         num_recursions=args.num_recursions,
         num_blocks_on_gpu2=0,
         block_lora_r=args.block_lora_r,
+        **dit_config,
     )
 
     # Cast all parameters to bfloat16
