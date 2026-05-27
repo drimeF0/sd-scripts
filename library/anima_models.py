@@ -779,6 +779,8 @@ class Block(nn.Module):
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
+        num_recursions: int = 1,
+        block_lora_r: int = 0,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -829,6 +831,15 @@ class Block(nn.Module):
         self.cpu_offload_checkpointing = False
         self.unsloth_offload_checkpointing = False
 
+        self.num_recursions = num_recursions
+        self.block_lora_r = block_lora_r
+        if block_lora_r > 0:
+            self.recursion_loras = nn.ModuleList([
+                RecursionBlockLoRA(x_dim, r=block_lora_r) for _ in range(num_recursions)
+            ])
+        else:
+            self.recursion_loras = None
+
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         self.gradient_checkpointing = True
         self.cpu_offload_checkpointing = cpu_offload if not unsloth_offload else False
@@ -856,6 +867,10 @@ class Block(nn.Module):
             torch.nn.init.zeros_(self.adaln_modulation_self_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_cross_attn[1].weight)
             torch.nn.init.zeros_(self.adaln_modulation_mlp[1].weight)
+
+        if self.recursion_loras is not None:
+            for lora in self.recursion_loras:
+                lora.reset_parameters()
 
     def init_weights(self) -> None:
         self.reset_parameters()
@@ -957,6 +972,9 @@ class Block(nn.Module):
         result = self.mlp(normalized_x)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
 
+        if self.recursion_loras is not None and recursion_idx is not None:
+            x_B_T_H_W_D = self.recursion_loras[recursion_idx](x_B_T_H_W_D)
+
         return x_B_T_H_W_D
 
     def forward(
@@ -969,6 +987,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        recursion_idx: Optional[int] = None,
     ) -> torch.Tensor:
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
@@ -983,6 +1002,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -1006,6 +1026,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                     use_reentrant=False,
                 )
             else:
@@ -1020,6 +1041,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                     use_reentrant=False,
                 )
         else:
@@ -1032,6 +1054,7 @@ class Block(nn.Module):
                 rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D,
                 extra_per_block_pos_emb,
+                recursion_idx,
             )
 
 
@@ -1131,9 +1154,6 @@ class Anima(nn.Module):
 
         # --- NEW: Per-recursion LoRA adapters ---
         self.block_lora_r = block_lora_r
-        self.block_loras = nn.ModuleList(
-            [RecursionBlockLoRA(model_channels, r=block_lora_r) for _ in range(num_recursions)]
-        )
 
         # --- NEW: Multi-GPU block offloading ---
         assert num_blocks_on_gpu2 >= 0, f"num_blocks_on_gpu2 must be >= 0, got {num_blocks_on_gpu2}"
@@ -1177,6 +1197,8 @@ class Anima(nn.Module):
                     mlp_ratio=mlp_ratio,
                     use_adaln_lora=use_adaln_lora,
                     adaln_lora_dim=adaln_lora_dim,
+                    num_recursions=num_recursions,
+                    block_lora_r=block_lora_r,
                 )
                 for _ in range(num_blocks)
             ]
@@ -1210,8 +1232,6 @@ class Anima(nn.Module):
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
         self.recursion_norm.reset_parameters()
-        for lora in self.block_loras:
-            lora.reset_parameters()
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         for block in self.blocks:
@@ -1476,6 +1496,7 @@ class Anima(nn.Module):
                         "rope_emb_L_1_1_D": _rope_on_gpu2,
                         "adaln_lora_B_T_3D": _adaln_on_gpu2,
                         "extra_per_block_pos_emb": _extra_pos_on_gpu2,
+                        "recursion_idx": recursion_idx,
                     }
 
                     x_B_T_H_W_D = block(
@@ -1485,9 +1506,11 @@ class Anima(nn.Module):
                     # Move result back to primary device
                     x_B_T_H_W_D = x_B_T_H_W_D.to(primary_device)
                 else:
+                    block_kwargs_with_recursion = block_kwargs.copy()
+                    block_kwargs_with_recursion["recursion_idx"] = recursion_idx
                     # Block is on the primary device — normal path
                     x_B_T_H_W_D = block(
-                        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs
+                        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs_with_recursion
                     )
 
                 # --- Block swap support (original) ---
@@ -1496,9 +1519,6 @@ class Anima(nn.Module):
 
             # --- Normalize hidden states after each recursion pass ---
             x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
-
-            # --- Apply per-recursion LoRA adapter ---
-            x_B_T_H_W_D = self.block_loras[recursion_idx](x_B_T_H_W_D)
 
         # =====================================================================
         # Final layer (always on primary device)
