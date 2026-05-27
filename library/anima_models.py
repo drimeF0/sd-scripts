@@ -229,7 +229,8 @@ class RMSNorm(torch.nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def reset_parameters(self) -> None:
-        torch.nn.init.ones_(self.weight)
+        if not self.weight.is_meta:
+            torch.nn.init.ones_(self.weight)
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
@@ -238,6 +239,36 @@ class RMSNorm(torch.nn.Module):
         with torch.autocast(device_type=x.device.type, dtype=torch.float32):
             output = self._norm(x.float()).type_as(x)
             return output * self.weight
+
+
+class RecursionBlockLoRA(nn.Module):
+    """LoRA adapter applied to hidden states at a specific recursion pass.
+
+    Architecture: x + up(down(x))  where up is zero-initialized so the
+    adapter starts as identity (no effect at the beginning of training).
+
+    Each recursion index gets its own independent RecursionBlockLoRA instance,
+    allowing the model to learn distinct corrections for each recursion pass.
+    """
+
+    def __init__(self, dim: int, r: int = 16) -> None:
+        super().__init__()
+        self.dim = dim
+        self.r = r
+        self.down = nn.Linear(dim, r, bias=False)
+        self.up = nn.Linear(r, dim, bias=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        # Kaiming uniform for the down-projection (standard for linear layers)
+        if not self.down.weight.is_meta:
+            nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        # Zero-init for the up-projection so LoRA starts as identity
+        if not self.up.weight.is_meta:
+            nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.up(self.down(x))
 
 
 class GPT2FeedForward(nn.Module):
@@ -1014,6 +1045,10 @@ class Anima(nn.Module):
     - Recursive architecture: the block loop can be executed multiple times (num_recursions).
       Default is 1 (original behavior). Set num_recursions > 1 to pass hidden states
       through the same block stack repeatedly, sharing weights across recursions.
+    - Per-recursion LoRA adapters: each recursion pass has its own low-rank adapter
+      (RecursionBlockLoRA with rank block_lora_r) applied after recursion_norm.
+      Zero-initialized up-projection means the model starts equivalent to no LoRA.
+      This allows learning distinct residual corrections per recursion pass.
     - Multi-GPU block offloading: the last `num_blocks_on_gpu2` blocks can be placed on
       a second GPU (gpu2_device). Hidden states are transferred to the second GPU before
       processing those blocks and back to the primary GPU afterward. Default is 0
@@ -1058,6 +1093,7 @@ class Anima(nn.Module):
         # --- NEW PARAMETERS ---
         num_recursions: int = 2,
         num_blocks_on_gpu2: int = 12,
+        block_lora_r: int = 16,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1092,6 +1128,12 @@ class Anima(nn.Module):
         # --- NEW: Recursive architecture ---
         assert num_recursions >= 1, f"num_recursions must be >= 1, got {num_recursions}"
         self.num_recursions = num_recursions
+
+        # --- NEW: Per-recursion LoRA adapters ---
+        self.block_lora_r = block_lora_r
+        self.block_loras = nn.ModuleList(
+            [RecursionBlockLoRA(model_channels, r=block_lora_r) for _ in range(num_recursions)]
+        )
 
         # --- NEW: Multi-GPU block offloading ---
         assert num_blocks_on_gpu2 >= 0, f"num_blocks_on_gpu2 must be >= 0, got {num_blocks_on_gpu2}"
@@ -1168,6 +1210,8 @@ class Anima(nn.Module):
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
         self.recursion_norm.reset_parameters()
+        for lora in self.block_loras:
+            lora.reset_parameters()
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         for block in self.blocks:
@@ -1453,6 +1497,9 @@ class Anima(nn.Module):
             # --- Normalize hidden states after each recursion pass ---
             x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
 
+            # --- Apply per-recursion LoRA adapter ---
+            x_B_T_H_W_D = self.block_loras[recursion_idx](x_B_T_H_W_D)
+
         # =====================================================================
         # Final layer (always on primary device)
         # =====================================================================
@@ -1715,3 +1762,173 @@ class LLMAdapter(nn.Module):
                 position_embeddings_context=position_embeddings_context,
             )
         return self.norm(self.out_proj(x))
+
+
+if __name__ == "__main__":
+    """
+    Create a fresh Anima model checkpoint from scratch and save it as a safetensors file in bfloat16.
+
+    Usage:
+        python -m library.anima_models
+        # or, if running standalone:
+        python anima_models.py
+
+    The output file is saved to: ./anima_initial_checkpoint.safetensors
+    """
+    import argparse
+    import os
+    import sys
+
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        print("safetensors is not installed. Install it with: pip install safetensors")
+        sys.exit(1)
+
+    # When running as __main__ from within the sd-scripts package,
+    # the relative imports (from .utils, from library) are already resolved.
+    # When running standalone, we need to mock them.
+    if "library" not in sys.modules or not hasattr(sys.modules["library"], "attention"):
+        # Provide minimal stubs so the module can be imported standalone
+        import types
+
+        # Stub for library.custom_offloading_utils
+        custom_offloading_utils = types.ModuleType("library.custom_offloading_utils")
+        custom_offloading_utils.ModelOffloader = None
+        sys.modules["library.custom_offloading_utils"] = custom_offloading_utils
+
+        # Stub for library.attention
+        attention_stub = types.ModuleType("library.attention")
+
+        class _StubAttentionParams:
+            @staticmethod
+            def create_attention_params(mode, split_attn):
+                return _StubAttentionParams()
+
+            @property
+            def supports_fp32(self):
+                return False
+
+            @property
+            def requires_same_dtype(self):
+                return False
+
+        attention_stub.AttentionParams = _StubAttentionParams
+
+        def _stub_attention(qkv, attn_params=None):
+            q, k, v = qkv
+            # Fallback: naive scaled dot-product (not efficient, just for checkpoint creation)
+            scale = k.shape[-1] ** -0.5
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
+            return torch.matmul(attn_weights, v)
+
+        attention_stub.attention = _stub_attention
+        sys.modules["library.attention"] = attention_stub
+
+        # Stub for library.utils
+        utils_stub = types.ModuleType("library.utils")
+        utils_stub.setup_logging = lambda: None
+        sys.modules["library.utils"] = utils_stub
+        sys.modules["library"] = types.ModuleType("library")
+
+    parser = argparse.ArgumentParser(description="Create a fresh Anima safetensors checkpoint in bfloat16")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="anima_initial_checkpoint.safetensors",
+        help="Output path for the safetensors checkpoint (default: anima_initial_checkpoint.safetensors)",
+    )
+    parser.add_argument(
+        "--model_channels",
+        type=int,
+        default=768,
+        help="Model hidden dimension (default: 768)",
+    )
+    parser.add_argument(
+        "--num_blocks",
+        type=int,
+        default=28,
+        help="Number of transformer blocks (default: 28)",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=16,
+        help="Number of attention heads (default: 16)",
+    )
+    parser.add_argument(
+        "--num_recursions",
+        type=int,
+        default=2,
+        help="Number of recursions through the block stack (default: 2)",
+    )
+    parser.add_argument(
+        "--block_lora_r",
+        type=int,
+        default=16,
+        help="LoRA rank for per-recursion adapters (default: 16)",
+    )
+    args = parser.parse_args()
+
+    # Cosmos-Predict2 2B architecture defaults
+    # Resolution: 480x720, max 93 frames (patched), 16 latent channels
+    model = Anima(
+        max_img_h=480,
+        max_img_w=720,
+        max_frames=93,
+        in_channels=Anima.LATENT_CHANNELS,  # 16
+        out_channels=Anima.LATENT_CHANNELS,  # 16
+        patch_spatial=2,
+        patch_temporal=1,
+        concat_padding_mask=True,
+        model_channels=args.model_channels,
+        num_blocks=args.num_blocks,
+        num_heads=args.num_heads,
+        mlp_ratio=4.0,
+        crossattn_emb_channels=1024,
+        pos_emb_cls="rope3d",
+        pos_emb_learnable=False,
+        pos_emb_interpolation="crop",
+        min_fps=1,
+        max_fps=30,
+        use_adaln_lora=False,
+        adaln_lora_dim=256,
+        rope_h_extrapolation_ratio=1.0,
+        rope_w_extrapolation_ratio=1.0,
+        rope_t_extrapolation_ratio=1.0,
+        extra_per_block_abs_pos_emb=False,
+        extra_h_extrapolation_ratio=1.0,
+        extra_w_extrapolation_ratio=1.0,
+        extra_t_extrapolation_ratio=1.0,
+        rope_enable_fps_modulation=True,
+        use_llm_adapter=False,
+        attn_mode="torch",
+        split_attn=False,
+        num_recursions=args.num_recursions,
+        num_blocks_on_gpu2=0,
+        block_lora_r=args.block_lora_r,
+    )
+
+    # Cast all parameters to bfloat16
+    model = model.to(dtype=torch.float16)
+
+    # Collect state dict (on CPU for portability)
+    state_dict = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
+
+    # Count parameters
+    total_params = sum(v.numel() for v in state_dict.values())
+    total_bytes = sum(v.nelement() * v.element_size() for v in state_dict.values())
+
+    output_path = args.output
+    save_file(state_dict, output_path)
+
+    print(f"Anima model checkpoint saved to: {os.path.abspath(output_path)}")
+    print(f"  dtype:         bfloat16")
+    print(f"  num_blocks:    {args.num_blocks}")
+    print(f"  num_recursions:{args.num_recursions}")
+    print(f"  block_lora_r:  {args.block_lora_r}")
+    print(f"  model_channels:{args.model_channels}")
+    print(f"  num_heads:     {args.num_heads}")
+    print(f"  total params:  {total_params:,}")
+    print(f"  file size:     {total_bytes / 1e9:.2f} GB ({total_bytes / 1e6:.1f} MB)")
