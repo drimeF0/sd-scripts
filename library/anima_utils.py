@@ -99,7 +99,7 @@ def load_anima_model(
     with init_empty_weights():
         model = anima_models.Anima(**dit_config)
         if dit_weight_dtype is not None:
-            model.to(dtype=dit_weight_dtype)
+            model.to_empty(dtype=dit_weight_dtype)
 
     # load model weights with dynamic fp8 optimization and LoRA merging if needed
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
