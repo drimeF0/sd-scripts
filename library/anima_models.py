@@ -1816,3 +1816,159 @@ class LLMAdapter(nn.Module):
                 position_embeddings_context=position_embeddings_context,
             )
         return self.norm(self.out_proj(x))
+    
+
+
+if __name__ == "__main__":
+    """
+    Create a fresh Anima model checkpoint from scratch and save it as a safetensors file in bfloat16.
+
+    Usage:
+        python -m library.anima_models
+        # or, if running standalone:
+        python anima_models.py
+
+    The output file is saved to: ./anima_initial_checkpoint.safetensors
+    """
+    import argparse
+    import os
+    import sys
+
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        print("safetensors is not installed. Install it with: pip install safetensors")
+        sys.exit(1)
+
+    # When running as __main__ from within the sd-scripts package,
+    # the relative imports (from .utils, from library) are already resolved.
+    # When running standalone, we need to mock them.
+    if "library" not in sys.modules or not hasattr(sys.modules["library"], "attention"):
+        # Provide minimal stubs so the module can be imported standalone
+        import types
+
+        # Stub for library.custom_offloading_utils
+        custom_offloading_utils = types.ModuleType("library.custom_offloading_utils")
+        custom_offloading_utils.ModelOffloader = None
+        sys.modules["library.custom_offloading_utils"] = custom_offloading_utils
+
+        # Stub for library.attention
+        attention_stub = types.ModuleType("library.attention")
+
+        class _StubAttentionParams:
+            @staticmethod
+            def create_attention_params(mode, split_attn):
+                return _StubAttentionParams()
+
+            @property
+            def supports_fp32(self):
+                return False
+
+            @property
+            def requires_same_dtype(self):
+                return False
+
+        attention_stub.AttentionParams = _StubAttentionParams
+
+        def _stub_attention(qkv, attn_params=None):
+            q, k, v = qkv
+            # Fallback: naive scaled dot-product (not efficient, just for checkpoint creation)
+            scale = k.shape[-1] ** -0.5
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+            attn_weights = torch.softmax(attn_weights.float(), dim=-1).to(q.dtype)
+            return torch.matmul(attn_weights, v)
+
+        attention_stub.attention = _stub_attention
+        sys.modules["library.attention"] = attention_stub
+
+        # Stub for library.utils
+        utils_stub = types.ModuleType("library.utils")
+        utils_stub.setup_logging = lambda: None
+        sys.modules["library.utils"] = utils_stub
+        sys.modules["library"] = types.ModuleType("library")
+
+    parser = argparse.ArgumentParser(description="Create a fresh Anima safetensors checkpoint in bfloat16")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="anima_initial_checkpoint.safetensors",
+        help="Output path for the safetensors checkpoint (default: anima_initial_checkpoint.safetensors)",
+    )
+    parser.add_argument(
+        "--num_recursions",
+        type=int,
+        default=2,
+        help="Number of recursions through the block stack (default: 2)",
+    )
+    parser.add_argument(
+        "--block_lora_r",
+        type=int,
+        default=16,
+        help="LoRA rank for per-recursion adapters (default: 16)",
+    )
+    args = parser.parse_args()
+
+    # Cosmos-Predict2 2B architecture defaults
+    # Resolution: 480x720, max 93 frames (patched), 16 latent channels
+    dit_config = {
+        "max_img_h": 512,
+        "max_img_w": 512,
+        "max_frames": 128,
+        "in_channels": 16,
+        "out_channels": 16,
+        "patch_spatial": 2,
+        "patch_temporal": 1,
+        "model_channels": 2048,
+        "concat_padding_mask": True,
+        "crossattn_emb_channels": 1024,
+        "pos_emb_cls": "rope3d",
+        "pos_emb_learnable": True,
+        "pos_emb_interpolation": "crop",
+        "min_fps": 1,
+        "max_fps": 30,
+        "use_adaln_lora": True,
+        "adaln_lora_dim": 256,
+        "num_blocks": 28,
+        "num_heads": 16,
+        "extra_per_block_abs_pos_emb": False,
+        "rope_h_extrapolation_ratio": 4.0,
+        "rope_w_extrapolation_ratio": 4.0,
+        "rope_t_extrapolation_ratio": 1.0,
+        "extra_h_extrapolation_ratio": 1.0,
+        "extra_w_extrapolation_ratio": 1.0,
+        "extra_t_extrapolation_ratio": 1.0,
+        "rope_enable_fps_modulation": False,
+        "use_llm_adapter": True,
+        "attn_mode": "torch",
+        "split_attn": False,
+    }
+    model = Anima(
+        num_recursions=args.num_recursions,
+        num_blocks_on_gpu2=0,
+        block_lora_r=args.block_lora_r,
+        **dit_config,
+    )
+
+    # Cast all parameters to bfloat16
+    model = model.to(dtype=torch.float16)
+
+    # Collect state dict (on CPU for portability)
+    state_dict = {k: v.cpu().contiguous() for k, v in model.state_dict().items()}
+
+    # Count parameters
+    total_params = sum(v.numel() for v in state_dict.values())
+    total_bytes = sum(v.nelement() * v.element_size() for v in state_dict.values())
+
+    output_path = args.output
+    save_file(state_dict, output_path)
+
+    print(f"Anima model checkpoint saved to: {os.path.abspath(output_path)}")
+    print(f"  dtype:         bfloat16")
+    print(f"  num_blocks:    {args.num_blocks}")
+    print(f"  num_recursions:{args.num_recursions}")
+    print(f"  block_lora_r:  {args.block_lora_r}")
+    print(f"  model_channels:{args.model_channels}")
+    print(f"  num_heads:     {args.num_heads}")
+    print(f"  total params:  {total_params:,}")
+    print(f"  file size:     {total_bytes / 1e9:.2f} GB ({total_bytes / 1e6:.1f} MB)")
+
