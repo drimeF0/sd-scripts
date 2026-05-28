@@ -240,6 +240,42 @@ class RMSNorm(torch.nn.Module):
             return output * self.weight
 
 
+class LoRALayer(nn.Module):
+    def __init__(self, in_dim, out_dim, r):
+        super().__init__()
+        self.down = nn.Linear(in_dim, r, bias=False)
+        self.up = nn.Linear(r, out_dim, bias=False)
+        nn.init.normal_(self.down.weight, std=1 / r)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        return self.up(self.down(x))
+
+
+class AttentionLoRA(nn.Module):
+    def __init__(self, query_dim, context_dim, inner_dim, r):
+        super().__init__()
+        self.q_lora = LoRALayer(query_dim, inner_dim, r)
+        self.k_lora = LoRALayer(context_dim, inner_dim, r)
+        self.v_lora = LoRALayer(context_dim, inner_dim, r)
+        self.o_lora = LoRALayer(inner_dim, query_dim, r)
+
+
+class MLPLoRA(nn.Module):
+    def __init__(self, in_dim, hidden_dim, r):
+        super().__init__()
+        self.fc1_lora = LoRALayer(in_dim, hidden_dim, r)
+        self.fc2_lora = LoRALayer(hidden_dim, in_dim, r)
+
+
+class BlockLoRA(nn.Module):
+    def __init__(self, x_dim, context_dim, inner_dim, mlp_hidden_dim, r):
+        super().__init__()
+        self.self_attn_lora = AttentionLoRA(x_dim, x_dim, inner_dim, r)
+        self.cross_attn_lora = AttentionLoRA(x_dim, context_dim, inner_dim, r)
+        self.mlp_lora = MLPLoRA(x_dim, mlp_hidden_dim, r)
+
+
 class GPT2FeedForward(nn.Module):
     """GELU feedforward network."""
 
@@ -263,11 +299,15 @@ class GPT2FeedForward(nn.Module):
             std = std / math.sqrt(2 * (self._layer_id + 1))
         torch.nn.init.trunc_normal_(self.layer2.weight, std=std, a=-3 * std, b=3 * std)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.layer1(x)
-        x = self.activation(x)
-        x = self.layer2(x)
-        return x
+    def forward(self, x: torch.Tensor, lora: Optional[MLPLoRA] = None) -> torch.Tensor:
+        h = self.layer1(x)
+        if lora is not None:
+            h = h + lora.fc1_lora(x)
+        h = self.activation(h)
+        out = self.layer2(h)
+        if lora is not None:
+            out = out + lora.fc2_lora(h)
+        return out
 
 
 # Attention module for DiT
@@ -334,11 +374,18 @@ class Attention(nn.Module):
         x: torch.Tensor,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
+        lora: Optional[AttentionLoRA] = None,
     ) -> tuple:
         q = self.q_proj(x)
+        if lora is not None:
+            q = q + lora.q_lora(x)
         context = x if context is None else context
         k = self.k_proj(context)
+        if lora is not None:
+            k = k + lora.k_lora(context)
         v = self.v_proj(context)
+        if lora is not None:
+            v = v + lora.v_lora(context)
         q, k, v = map(
             lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
             (q, k, v),
@@ -359,8 +406,9 @@ class Attention(nn.Module):
         attn_params: attention.AttentionParams,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
+        lora: Optional[AttentionLoRA] = None,
     ) -> torch.Tensor:
-        q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
+        q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb, lora=lora)
         if q.dtype != v.dtype:
             if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
                 # FlashAttention requires fp16/bf16, xformers require same dtype; only cast when autocast is active.
@@ -371,7 +419,10 @@ class Attention(nn.Module):
         qkv = [q, k, v]
         del q, k, v
         result = attention.attention(qkv, attn_params=attn_params)
-        return self.output_dropout(self.output_proj(result))
+        output = self.output_proj(result)
+        if lora is not None:
+            output = output + lora.o_lora(result)
+        return self.output_dropout(output)
 
 
 # Positional Embeddings
@@ -748,6 +799,8 @@ class Block(nn.Module):
         mlp_ratio: float = 4.0,
         use_adaln_lora: bool = False,
         adaln_lora_dim: int = 256,
+        block_lora_r: int = 0,
+        num_recursions: int = 1,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -771,6 +824,21 @@ class Block(nn.Module):
 
         self.layer_norm_mlp = nn.LayerNorm(x_dim, elementwise_affine=False, eps=1e-6)
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
+
+        self.block_lora_r = block_lora_r
+        if block_lora_r > 0 and num_recursions > 1:
+            self.loras = nn.ModuleList([
+                BlockLoRA(
+                    x_dim=x_dim,
+                    context_dim=context_dim,
+                    inner_dim=x_dim,
+                    mlp_hidden_dim=int(x_dim * mlp_ratio),
+                    r=block_lora_r
+                )
+                for _ in range(num_recursions - 1)
+            ])
+        else:
+            self.loras = None
 
         self.use_adaln_lora = use_adaln_lora
         if self.use_adaln_lora:
@@ -842,6 +910,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        recursion_idx: int = 0,
     ) -> torch.Tensor:
         if use_fp32:
             # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
@@ -886,6 +955,11 @@ class Block(nn.Module):
 
         B, T, H, W, D = x_B_T_H_W_D.shape
 
+        if self.loras is not None and recursion_idx > 0:
+            current_lora = self.loras[recursion_idx - 1]
+        else:
+            current_lora = None
+
         def _adaln_fn(_x, _norm_layer, _scale, _shift):
             return _norm_layer(_x) * (1 + _scale) + _shift
 
@@ -897,6 +971,7 @@ class Block(nn.Module):
                 attn_params,
                 None,
                 rope_emb=rope_emb_L_1_1_D,
+                lora=current_lora.self_attn_lora if current_lora is not None else None,
             ),
             "b (t h w) d -> b t h w d",
             t=T,
@@ -913,6 +988,7 @@ class Block(nn.Module):
                 attn_params,
                 crossattn_emb,
                 rope_emb=rope_emb_L_1_1_D,
+                lora=current_lora.cross_attn_lora if current_lora is not None else None,
             ),
             "b (t h w) d -> b t h w d",
             t=T,
@@ -923,7 +999,7 @@ class Block(nn.Module):
 
         # 3. MLP
         normalized_x = _adaln_fn(x_B_T_H_W_D, self.layer_norm_mlp, scale_mlp_B_T_1_1_D, shift_mlp_B_T_1_1_D)
-        result = self.mlp(normalized_x)
+        result = self.mlp(normalized_x, lora=current_lora.mlp_lora if current_lora is not None else None)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
 
         return x_B_T_H_W_D
@@ -938,6 +1014,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        recursion_idx: int = 0,
     ) -> torch.Tensor:
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
@@ -952,6 +1029,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -975,6 +1053,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                     use_reentrant=False,
                 )
             else:
@@ -989,6 +1068,7 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    recursion_idx,
                     use_reentrant=False,
                 )
         else:
@@ -1001,6 +1081,7 @@ class Block(nn.Module):
                 rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D,
                 extra_per_block_pos_emb,
+                recursion_idx,
             )
 
 
@@ -1058,6 +1139,9 @@ class Anima(nn.Module):
         # --- NEW PARAMETERS ---
         num_recursions: int = 2,
         num_blocks_on_gpu2: int = 12,
+        block_lora_r: int = 32,
+        recursion_start_block: Optional[int] = 9,
+        recursion_end_block: Optional[int] = 17,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1092,6 +1176,9 @@ class Anima(nn.Module):
         # --- NEW: Recursive architecture ---
         assert num_recursions >= 1, f"num_recursions must be >= 1, got {num_recursions}"
         self.num_recursions = num_recursions
+        self.block_lora_r = block_lora_r
+        self.recursion_start_block = recursion_start_block if recursion_start_block is not None else 0
+        self.recursion_end_block = recursion_end_block if recursion_end_block is not None else num_blocks
 
         # --- NEW: Multi-GPU block offloading ---
         assert num_blocks_on_gpu2 >= 0, f"num_blocks_on_gpu2 must be >= 0, got {num_blocks_on_gpu2}"
@@ -1126,8 +1213,10 @@ class Anima(nn.Module):
                 self_attn=True,
             )
 
-        self.blocks = nn.ModuleList(
-            [
+        self.blocks = nn.ModuleList()
+        for i in range(num_blocks):
+            is_middle = (self.recursion_start_block <= i < self.recursion_end_block)
+            self.blocks.append(
                 Block(
                     x_dim=model_channels,
                     context_dim=crossattn_emb_channels,
@@ -1135,10 +1224,10 @@ class Anima(nn.Module):
                     mlp_ratio=mlp_ratio,
                     use_adaln_lora=use_adaln_lora,
                     adaln_lora_dim=adaln_lora_dim,
+                    block_lora_r=block_lora_r,
+                    num_recursions=num_recursions if is_middle else 1,
                 )
-                for _ in range(num_blocks)
-            ]
-        )
+            )
 
         self.final_layer = FinalLayer(
             hidden_size=self.model_channels,
@@ -1404,54 +1493,66 @@ class Anima(nn.Module):
         primary_device = x_B_T_H_W_D.device
 
         # =====================================================================
-        # RECURSIVE ARCHITECTURE: iterate through all blocks num_recursions times.
-        # The same blocks are reused (weight-shared) across recursions.
-        # With num_recursions=1 this is identical to the original single pass.
+        # RECURSIVE ARCHITECTURE: iterate through middle blocks num_recursions times.
+        # The same blocks are reused (weight-shared) across recursions with LoRA adapters.
         # =====================================================================
+        
+        def process_block(block_idx, block, rec_idx=0):
+            nonlocal x_B_T_H_W_D
+            # --- Block swap support (original) ---
+            if self.blocks_to_swap:
+                self.offloader.wait_for_block(block_idx)
+
+            # --- Multi-GPU2 offloading: transfer hidden states if needed ---
+            target_device = self._get_block_device(block_idx)
+            if target_device is not None:
+                x_B_T_H_W_D = x_B_T_H_W_D.to(target_device)
+                # Also move crossattn_emb and t_embedding if they are needed on GPU2
+                # for the cross-attention and AdaLN modulation respectively.
+                # We save the originals on primary device and restore after the block.
+                _crossattn_on_gpu2 = crossattn_emb.to(target_device)
+                _temb_on_gpu2 = t_embedding_B_T_D.to(target_device)
+                # Move rope_emb and adaln_lora if present
+                _rope_on_gpu2 = rope_emb_L_1_1_D.to(target_device) if rope_emb_L_1_1_D is not None else None
+                _adaln_on_gpu2 = adaln_lora_B_T_3D.to(target_device) if adaln_lora_B_T_3D is not None else None
+                _extra_pos_on_gpu2 = extra_pos_emb.to(target_device) if extra_pos_emb is not None else None
+
+                gpu2_block_kwargs = {
+                    "rope_emb_L_1_1_D": _rope_on_gpu2,
+                    "adaln_lora_B_T_3D": _adaln_on_gpu2,
+                    "extra_per_block_pos_emb": _extra_pos_on_gpu2,
+                }
+
+                x_B_T_H_W_D = block(
+                    x_B_T_H_W_D, _temb_on_gpu2, _crossattn_on_gpu2, attn_params, use_fp32, **gpu2_block_kwargs, recursion_idx=rec_idx
+                )
+
+                # Move result back to primary device
+                x_B_T_H_W_D = x_B_T_H_W_D.to(primary_device)
+            else:
+                # Block is on the primary device — normal path
+                x_B_T_H_W_D = block(
+                    x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs, recursion_idx=rec_idx
+                )
+
+            # --- Block swap support (original) ---
+            if self.blocks_to_swap:
+                self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        # Pre-middle blocks
+        for block_idx in range(0, self.recursion_start_block):
+            process_block(block_idx, self.blocks[block_idx], 0)
+
+        # Middle blocks
         for recursion_idx in range(self.num_recursions):
-            for block_idx, block in enumerate(self.blocks):
-                # --- Block swap support (original) ---
-                if self.blocks_to_swap:
-                    self.offloader.wait_for_block(block_idx)
-
-                # --- Multi-GPU2 offloading: transfer hidden states if needed ---
-                target_device = self._get_block_device(block_idx)
-                if target_device is not None:
-                    x_B_T_H_W_D = x_B_T_H_W_D.to(target_device)
-                    # Also move crossattn_emb and t_embedding if they are needed on GPU2
-                    # for the cross-attention and AdaLN modulation respectively.
-                    # We save the originals on primary device and restore after the block.
-                    _crossattn_on_gpu2 = crossattn_emb.to(target_device)
-                    _temb_on_gpu2 = t_embedding_B_T_D.to(target_device)
-                    # Move rope_emb and adaln_lora if present
-                    _rope_on_gpu2 = rope_emb_L_1_1_D.to(target_device) if rope_emb_L_1_1_D is not None else None
-                    _adaln_on_gpu2 = adaln_lora_B_T_3D.to(target_device) if adaln_lora_B_T_3D is not None else None
-                    _extra_pos_on_gpu2 = extra_pos_emb.to(target_device) if extra_pos_emb is not None else None
-
-                    gpu2_block_kwargs = {
-                        "rope_emb_L_1_1_D": _rope_on_gpu2,
-                        "adaln_lora_B_T_3D": _adaln_on_gpu2,
-                        "extra_per_block_pos_emb": _extra_pos_on_gpu2,
-                    }
-
-                    x_B_T_H_W_D = block(
-                        x_B_T_H_W_D, _temb_on_gpu2, _crossattn_on_gpu2, attn_params, use_fp32, **gpu2_block_kwargs
-                    )
-
-                    # Move result back to primary device
-                    x_B_T_H_W_D = x_B_T_H_W_D.to(primary_device)
-                else:
-                    # Block is on the primary device — normal path
-                    x_B_T_H_W_D = block(
-                        x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs
-                    )
-
-                # --- Block swap support (original) ---
-                if self.blocks_to_swap:
-                    self.offloader.submit_move_blocks(self.blocks, block_idx)
-
+            for block_idx in range(self.recursion_start_block, self.recursion_end_block):
+                process_block(block_idx, self.blocks[block_idx], recursion_idx)
             # --- Normalize hidden states after each recursion pass ---
             x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
+
+        # Post-middle blocks
+        for block_idx in range(self.recursion_end_block, self.num_blocks):
+            process_block(block_idx, self.blocks[block_idx], 0)
 
         # =====================================================================
         # Final layer (always on primary device)
