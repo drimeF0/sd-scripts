@@ -125,7 +125,7 @@ def unsloth_checkpoint(function, *args):
     return UnslothOffloadedGradientCheckpointer.apply(function, *args)
 
 
-from .utils import setup_logging
+from library.utils import setup_logging
 
 setup_logging()
 import logging
