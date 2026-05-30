@@ -1138,7 +1138,7 @@ class Anima(nn.Module):
         split_attn: bool = False,
         # --- NEW PARAMETERS ---
         num_recursions: int = 2,
-        num_blocks_on_gpu2: int = 12,
+        num_blocks_on_gpu2: int = 16,
         block_lora_r: int = 64,
         recursion_start_block: Optional[int] = 0,
         recursion_end_block: Optional[int] = 28,
