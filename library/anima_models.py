@@ -1256,7 +1256,7 @@ class Anima(nn.Module):
             block.init_weights()
         self.final_layer.init_weights()
         self.t_embedding_norm.reset_parameters()
-        self.recursion_norm.reset_parameters()
+        #self.recursion_norm.reset_parameters()
 
     def enable_gradient_checkpointing(self, cpu_offload: bool = False, unsloth_offload: bool = False):
         for block in self.blocks:
