@@ -1140,8 +1140,8 @@ class Anima(nn.Module):
         num_recursions: int = 2,
         num_blocks_on_gpu2: int = 12,
         block_lora_r: int = 32,
-        recursion_start_block: Optional[int] = 9,
-        recursion_end_block: Optional[int] = 17,
+        recursion_start_block: Optional[int] = 0,
+        recursion_end_block: Optional[int] = 28,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1240,8 +1240,8 @@ class Anima(nn.Module):
 
         self.t_embedding_norm = RMSNorm(model_channels, eps=1e-6)
 
-        # RMSNorm applied to x_B_T_H_W_D after each recursion pass
-        self.recursion_norm = RMSNorm(model_channels, eps=1e-6)
+        # # RMSNorm applied to x_B_T_H_W_D after each recursion pass
+        # self.recursion_norm = RMSNorm(model_channels, eps=1e-6)
         self.init_weights()
 
         
@@ -1539,20 +1539,20 @@ class Anima(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
 
-        # Pre-middle blocks
-        for block_idx in range(0, self.recursion_start_block):
-            process_block(block_idx, self.blocks[block_idx], 0)
+        # # Pre-middle blocks
+        # for block_idx in range(0, self.recursion_start_block):
+        #     process_block(block_idx, self.blocks[block_idx], 0)
 
         # Middle blocks
         for recursion_idx in range(self.num_recursions):
             for block_idx in range(self.recursion_start_block, self.recursion_end_block):
                 process_block(block_idx, self.blocks[block_idx], recursion_idx)
             # --- Normalize hidden states after each recursion pass ---
-            x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
+            #x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
 
-        # Post-middle blocks
-        for block_idx in range(self.recursion_end_block, self.num_blocks):
-            process_block(block_idx, self.blocks[block_idx], 0)
+        # # Post-middle blocks
+        # for block_idx in range(self.recursion_end_block, self.num_blocks):
+        #     process_block(block_idx, self.blocks[block_idx], 0)
 
         # =====================================================================
         # Final layer (always on primary device)
