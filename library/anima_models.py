@@ -249,7 +249,9 @@ class LoRALayer(nn.Module):
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
-        return self.up(self.down(x))
+        down_w = self.down.weight.to(x.device)
+        up_w = self.up.weight.to(x.device)
+        return F.linear(F.linear(x, down_w), up_w)
 
 
 class AttentionLoRA(nn.Module):
@@ -274,6 +276,82 @@ class BlockLoRA(nn.Module):
         self.self_attn_lora = AttentionLoRA(x_dim, x_dim, inner_dim, r)
         self.cross_attn_lora = AttentionLoRA(x_dim, context_dim, inner_dim, r)
         self.mlp_lora = MLPLoRA(x_dim, mlp_hidden_dim, r)
+
+
+class SubActiveMoLE:
+    def __init__(self, active_mole, component):
+        self.active_mole = active_mole
+        self.component = component
+        
+    @property
+    def q_lora(self): return lambda x: self.active_mole(x, self.component, 'q_lora')
+    @property
+    def k_lora(self): return lambda x: self.active_mole(x, self.component, 'k_lora')
+    @property
+    def v_lora(self): return lambda x: self.active_mole(x, self.component, 'v_lora')
+    @property
+    def o_lora(self): return lambda x: self.active_mole(x, self.component, 'o_lora')
+    @property
+    def fc1_lora(self): return lambda x: self.active_mole(x, self.component, 'fc1_lora')
+    @property
+    def fc2_lora(self): return lambda x: self.active_mole(x, self.component, 'fc2_lora')
+
+class ActiveMoLEBlockLoRA:
+    def __init__(self, mole_module, indices, weights):
+        self.mole = mole_module
+        self.indices = indices
+        self.weights = weights
+        
+    def __call__(self, x, component, sub_component=None):
+        out = torch.zeros_like(x)
+        unique_experts = torch.unique(self.indices)
+        
+        for expert_idx in unique_experts:
+            mask = (self.indices == expert_idx)
+            batch_mask = mask.any(dim=-1)
+            if not batch_mask.any():
+                continue
+                
+            expert = self.mole.experts[expert_idx]
+            expert_component = getattr(expert, component)
+            lora_layer = getattr(expert_component, sub_component) if sub_component else expert_component
+            
+            x_expert = x[batch_mask]
+            out_expert = lora_layer(x_expert)
+            
+            w = self.weights[mask]
+            w = w.view(-1, *([1]*(out_expert.dim() - 1)))
+            out[batch_mask] += out_expert * w
+            
+        return out
+
+    @property
+    def self_attn_lora(self): return SubActiveMoLE(self, 'self_attn_lora')
+
+    @property
+    def cross_attn_lora(self): return SubActiveMoLE(self, 'cross_attn_lora')
+
+    @property
+    def mlp_lora(self): return SubActiveMoLE(self, 'mlp_lora')
+
+class MoLEBlockLoRA(nn.Module):
+    def __init__(self, x_dim, context_dim, inner_dim, mlp_hidden_dim, r, num_experts=8, top_k=1, offload_experts=True):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.offload_experts = offload_experts
+        
+        self.experts = nn.ModuleList([
+            BlockLoRA(x_dim, context_dim, inner_dim, mlp_hidden_dim, r)
+            for _ in range(num_experts)
+        ])
+        self.router = nn.Linear(x_dim, num_experts, bias=False)
+        
+    def _apply(self, fn):
+        super()._apply(fn)
+        if self.offload_experts:
+            self.experts.to('cpu')
+        return self
 
 
 class GPT2FeedForward(nn.Module):
@@ -801,6 +879,9 @@ class Block(nn.Module):
         adaln_lora_dim: int = 256,
         block_lora_r: int = 0,
         num_recursions: int = 1,
+        num_experts: int = 1,
+        top_k: int = 1,
+        offload_experts: bool = False,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -826,18 +907,36 @@ class Block(nn.Module):
         self.mlp = GPT2FeedForward(x_dim, int(x_dim * mlp_ratio))
 
         self.block_lora_r = block_lora_r
-        if block_lora_r > 0 and num_recursions > 1:
-            self.loras = nn.ModuleList([
-                BlockLoRA(
-                    x_dim=x_dim,
-                    context_dim=context_dim,
-                    inner_dim=x_dim,
-                    mlp_hidden_dim=int(x_dim * mlp_ratio),
-                    r=block_lora_r
-                )
-                for _ in range(num_recursions - 1)
-            ])
+        if block_lora_r > 0:
+            if num_experts > 1:
+                self.mole_loras = nn.ModuleList([
+                    MoLEBlockLoRA(
+                        x_dim=x_dim,
+                        context_dim=context_dim,
+                        inner_dim=x_dim,
+                        mlp_hidden_dim=int(x_dim * mlp_ratio),
+                        r=block_lora_r,
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        offload_experts=offload_experts
+                    )
+                    for _ in range(num_recursions)
+                ])
+                self.loras = None
+            else:
+                self.mole_loras = None
+                self.loras = nn.ModuleList([
+                    BlockLoRA(
+                        x_dim=x_dim,
+                        context_dim=context_dim,
+                        inner_dim=x_dim,
+                        mlp_hidden_dim=int(x_dim * mlp_ratio),
+                        r=block_lora_r
+                    )
+                    for _ in range(num_recursions)
+                ])
         else:
+            self.mole_loras = None
             self.loras = None
 
         self.use_adaln_lora = use_adaln_lora
@@ -911,7 +1010,7 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         recursion_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if use_fp32:
             # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
             x_B_T_H_W_D = x_B_T_H_W_D.float()
@@ -954,9 +1053,27 @@ class Block(nn.Module):
         gate_mlp_B_T_1_1_D = rearrange(gate_mlp_B_T_D, "b t d -> b t 1 1 d")
 
         B, T, H, W, D = x_B_T_H_W_D.shape
+        mole_loss = torch.tensor(0.0, device=x_B_T_H_W_D.device)
 
-        if self.loras is not None and recursion_idx > 0:
-            current_lora = self.loras[recursion_idx - 1]
+        if self.mole_loras is not None:
+            current_mole = self.mole_loras[recursion_idx]
+            pooled_x = x_B_T_H_W_D.mean(dim=(1, 2, 3))
+            router_logits = current_mole.router(pooled_x)
+            
+            routing_weights = F.softmax(router_logits, dim=-1)
+            top_k_weights, top_k_indices = torch.topk(routing_weights, current_mole.top_k, dim=-1)
+            top_k_weights = top_k_weights / top_k_weights.sum(dim=-1, keepdim=True)
+            
+            if self.training:
+                P_i = routing_weights.mean(dim=0)
+                mask = torch.zeros_like(routing_weights)
+                mask.scatter_(1, top_k_indices, 1.0)
+                f_i = mask.mean(dim=0)
+                mole_loss = current_mole.num_experts * torch.sum(f_i * P_i)
+                
+            current_lora = ActiveMoLEBlockLoRA(current_mole, top_k_indices, top_k_weights)
+        elif self.loras is not None:
+            current_lora = self.loras[recursion_idx]
         else:
             current_lora = None
 
@@ -1002,7 +1119,7 @@ class Block(nn.Module):
         result = self.mlp(normalized_x, lora=current_lora.mlp_lora if current_lora is not None else None)
         x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp_B_T_1_1_D * result
 
-        return x_B_T_H_W_D
+        return x_B_T_H_W_D, mole_loss
 
     def forward(
         self,
@@ -1015,11 +1132,11 @@ class Block(nn.Module):
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
         recursion_idx: int = 0,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
                 # Unsloth: async non-blocking CPU RAM offload (fastest offload method)
-                return unsloth_checkpoint(
+                out = unsloth_checkpoint(
                     self._forward,
                     x_B_T_H_W_D,
                     emb_B_T_D,
@@ -1031,6 +1148,7 @@ class Block(nn.Module):
                     extra_per_block_pos_emb,
                     recursion_idx,
                 )
+                return out[0], out[1]
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
                 def create_custom_forward(func):
@@ -1043,7 +1161,7 @@ class Block(nn.Module):
 
                     return custom_forward
 
-                return torch_checkpoint(
+                out = torch_checkpoint(
                     create_custom_forward(self._forward),
                     x_B_T_H_W_D,
                     emb_B_T_D,
@@ -1056,9 +1174,10 @@ class Block(nn.Module):
                     recursion_idx,
                     use_reentrant=False,
                 )
+                return out[0], out[1]
             else:
                 # Standard gradient checkpointing (no offload)
-                return torch_checkpoint(
+                out = torch_checkpoint(
                     self._forward,
                     x_B_T_H_W_D,
                     emb_B_T_D,
@@ -1071,6 +1190,7 @@ class Block(nn.Module):
                     recursion_idx,
                     use_reentrant=False,
                 )
+                return out[0], out[1]
         else:
             return self._forward(
                 x_B_T_H_W_D,
@@ -1142,6 +1262,9 @@ class Anima(nn.Module):
         block_lora_r: int = 64,
         recursion_start_block: Optional[int] = 0,
         recursion_end_block: Optional[int] = 28,
+        num_experts: int = 8,
+        top_k: int = 1,
+        offload_experts: bool = True,
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1226,6 +1349,9 @@ class Anima(nn.Module):
                     adaln_lora_dim=adaln_lora_dim,
                     block_lora_r=block_lora_r,
                     num_recursions=num_recursions if is_middle else 1,
+                    num_experts=num_experts if is_middle else 1,
+                    top_k=top_k,
+                    offload_experts=offload_experts,
                 )
             )
 
@@ -1497,8 +1623,10 @@ class Anima(nn.Module):
         # The same blocks are reused (weight-shared) across recursions with LoRA adapters.
         # =====================================================================
         
+        total_router_loss = 0.0
+        
         def process_block(block_idx, block, rec_idx=0):
-            nonlocal x_B_T_H_W_D
+            nonlocal x_B_T_H_W_D, total_router_loss
             # --- Block swap support (original) ---
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
@@ -1523,17 +1651,27 @@ class Anima(nn.Module):
                     "extra_per_block_pos_emb": _extra_pos_on_gpu2,
                 }
 
-                x_B_T_H_W_D = block(
+                out = block(
                     x_B_T_H_W_D, _temb_on_gpu2, _crossattn_on_gpu2, attn_params, use_fp32, **gpu2_block_kwargs, recursion_idx=rec_idx
                 )
 
                 # Move result back to primary device
+                if isinstance(out, tuple):
+                    x_B_T_H_W_D, mole_loss = out
+                    total_router_loss = total_router_loss + mole_loss.to(primary_device)
+                else:
+                    x_B_T_H_W_D = out
                 x_B_T_H_W_D = x_B_T_H_W_D.to(primary_device)
             else:
                 # Block is on the primary device — normal path
-                x_B_T_H_W_D = block(
+                out = block(
                     x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs, recursion_idx=rec_idx
                 )
+                if isinstance(out, tuple):
+                    x_B_T_H_W_D, mole_loss = out
+                    total_router_loss = total_router_loss + mole_loss
+                else:
+                    x_B_T_H_W_D = out
 
             # --- Block swap support (original) ---
             if self.blocks_to_swap:
@@ -1549,6 +1687,8 @@ class Anima(nn.Module):
                 process_block(block_idx, self.blocks[block_idx], recursion_idx)
             # --- Normalize hidden states after each recursion pass ---
             #x_B_T_H_W_D = self.recursion_norm(x_B_T_H_W_D)
+            
+        self.router_loss = total_router_loss
 
         # # Post-middle blocks
         # for block_idx in range(self.recursion_end_block, self.num_blocks):
@@ -1949,7 +2089,7 @@ if __name__ == "__main__":
         **dit_config,
     )
 
-    # Cast all parameters to bfloat16
+    # Cast all parameters to float16
     model = model.to(dtype=torch.float16)
 
     # Collect state dict (on CPU for portability)
