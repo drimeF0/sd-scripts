@@ -587,6 +587,8 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
+                loss = dit.router_loss
+
                 accelerator.backward(loss)
 
                 if not args.fused_backward_pass:
