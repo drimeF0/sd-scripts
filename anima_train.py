@@ -587,7 +587,7 @@ def train(args):
                 loss = loss * loss_weights
                 loss = loss.mean()
 
-                loss = dit.router_loss
+                loss = loss + 0.1 * dit.router_loss
 
                 accelerator.backward(loss)
 
