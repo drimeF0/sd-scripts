@@ -245,7 +245,7 @@ class LoRALayer(nn.Module):
         super().__init__()
         self.down = nn.Linear(in_dim, r, bias=False)
         self.up = nn.Linear(r, out_dim, bias=False)
-        nn.init.normal_(self.down.weight, std=1 / r)
+        nn.init.kaiming_uniform_(self.down.weight, math.sqrt(5))
         nn.init.zeros_(self.up.weight)
 
     def forward(self, x):
@@ -1269,7 +1269,7 @@ class Anima(nn.Module):
         block_lora_r: int = 64,
         recursion_start_block: Optional[int] = 0,
         recursion_end_block: Optional[int] = 28,
-        num_experts: int = 8,
+        num_experts: int = 0,
         top_k: int = 1,
         offload_experts: bool = True,
     ) -> None:
