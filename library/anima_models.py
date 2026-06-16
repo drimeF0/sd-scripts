@@ -303,7 +303,7 @@ class ActiveMoLEBlockLoRA:
         self.weights = weights
         
     def __call__(self, x, component, sub_component=None):
-        out = torch.zeros_like(x)
+        out = None
         unique_experts = torch.unique(self.indices)
         
         for expert_idx in unique_experts:
@@ -319,10 +319,17 @@ class ActiveMoLEBlockLoRA:
             x_expert = x[batch_mask]
             out_expert = lora_layer(x_expert)
             
+            if out is None:
+                out_shape = list(x.shape)
+                out_shape[-1] = out_expert.shape[-1]
+                out = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
+            
             w = self.weights[mask]
             w = w.view(-1, *([1]*(out_expert.dim() - 1)))
             out[batch_mask] += out_expert * w
-            
+        
+        if out is None:
+            out = torch.zeros_like(x)
         return out
 
     @property
