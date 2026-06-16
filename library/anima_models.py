@@ -2043,7 +2043,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--block_lora_r",
         type=int,
-        default=16,
+        default=64,
         help="LoRA rank for per-recursion adapters (default: 16)",
     )
     args = parser.parse_args()
@@ -2103,12 +2103,6 @@ if __name__ == "__main__":
     save_file(state_dict, output_path)
 
     print(f"Anima model checkpoint saved to: {os.path.abspath(output_path)}")
-    print(f"  dtype:         bfloat16")
-    print(f"  num_blocks:    {args.num_blocks}")
-    print(f"  num_recursions:{args.num_recursions}")
-    print(f"  block_lora_r:  {args.block_lora_r}")
-    print(f"  model_channels:{args.model_channels}")
-    print(f"  num_heads:     {args.num_heads}")
-    print(f"  total params:  {total_params:,}")
+    print(f"  dtype:         float16")
     print(f"  file size:     {total_bytes / 1e9:.2f} GB ({total_bytes / 1e6:.1f} MB)")
 
