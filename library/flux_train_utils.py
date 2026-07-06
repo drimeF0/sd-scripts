@@ -433,23 +433,37 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    base_u: Optional[torch.Tensor] = None,
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+
+    ``base_u`` optionally supplies a pre-drawn uniform quantile in [0, 1] (e.g. restricted to a
+    sub-range via ``--timestep_total_blocks``). When given, the ``logit_normal`` / ``mode`` shaping is
+    applied on top of it, so the range restriction happens BEFORE the distribution modification. When
+    ``None`` the original independent sampling is used, leaving existing behavior bit-for-bit unchanged.
     """
     if weighting_scheme == "logit_normal":
         # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
-        u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        if base_u is None:
+            u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        else:
+            # Reparametrize a N(mean, std) draw from the restricted uniform quantile via the probit (inverse-CDF).
+            u = logit_mean + logit_std * _uniform_to_standard_normal(base_u)
         u = torch.nn.functional.sigmoid(u)
     elif weighting_scheme == "mode":
-        u = torch.rand(size=(batch_size,), device="cpu")
+        u = torch.rand(size=(batch_size,), device="cpu") if base_u is None else base_u
         u = 1 - u - mode_scale * (torch.cos(math.pi * u / 2) ** 2 - 1 + u)
     else:
-        u = torch.rand(size=(batch_size,), device="cpu")
+        u = torch.rand(size=(batch_size,), device="cpu") if base_u is None else base_u
     return u
 
 
@@ -470,30 +484,87 @@ def compute_loss_weighting_for_sd3(weighting_scheme: str, sigmas=None):
     return weighting
 
 
+def _uniform_to_standard_normal(u: torch.Tensor) -> torch.Tensor:
+    """Probit (inverse standard-normal CDF) via erfinv: maps U(0, 1) -> N(0, 1).
+
+    Vectorized form of ``z = sqrt(2) * erfinv(2u - 1)``. Restricting ``u`` to a sub-range of [0, 1]
+    before this call restricts the resulting normal (and therefore the shaped timestep) to the matching
+    quantile band. This is how a step range is applied *before* sigmoid / shift / logit_normal shaping.
+    """
+    u = torch.clamp(u, min=1e-7, max=1.0 - 1e-7)  # avoid erfinv(+-1) = +-inf
+    return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+
+
+def get_timestep_quantile_range(args) -> Tuple[float, float]:
+    """(lo, hi) sub-range of the base [0, 1] sampling quantile, applied BEFORE any distribution
+    shaping (sigmoid / discrete_flow_shift / flux_shift / logit_normal).
+
+    Controlled by the Anima args ``--timestep_total_blocks`` / ``--timestep_block_idx``: the [0, 1]
+    quantile is split into ``total_blocks`` equal blocks and only block ``block_idx`` is sampled
+    (e.g. total=3, idx=0 -> [0.0, 0.333); idx=2 -> [0.666, 1.0)). Returns the full range (0.0, 1.0)
+    when unset, so behavior is unchanged by default and for callers (FLUX) not defining these args.
+    """
+    total = getattr(args, "timestep_total_blocks", None)
+    if not total or total <= 1:
+        return 0.0, 1.0
+    idx = getattr(args, "timestep_block_idx", None) or 0
+    if idx < 0 or idx >= total:
+        raise ValueError(
+            f"--timestep_block_idx must be in [0, {total - 1}] for --timestep_total_blocks={total}, got {idx}"
+        )
+    return idx / total, (idx + 1) / total
+
+
+def _sample_base_uniform(bsz: int, lo: float, hi: float, device) -> torch.Tensor:
+    """Uniform sample in [lo, hi). When unrestricted ((lo, hi) == (0, 1)) returns ``torch.rand``
+    unchanged, preserving the original RNG stream."""
+    u = torch.rand((bsz,), device=device)
+    if lo == 0.0 and hi == 1.0:
+        return u
+    return lo + u * (hi - lo)
+
+
+def _sample_base_normal(bsz: int, lo: float, hi: float, device) -> torch.Tensor:
+    """Standard-normal sample whose underlying uniform quantile is restricted to [lo, hi).
+
+    When unrestricted ((lo, hi) == (0, 1)) this returns ``torch.randn`` directly, keeping the RNG
+    stream identical to the original code so existing (full-range) runs are bit-for-bit unchanged.
+    """
+    if lo == 0.0 and hi == 1.0:
+        return torch.randn((bsz,), device=device)
+    u = lo + torch.rand((bsz,), device=device) * (hi - lo)
+    return _uniform_to_standard_normal(u)
+
+
 def get_noisy_model_input_and_timesteps(
     args, noise_scheduler, latents: torch.Tensor, noise: torch.Tensor, device, dtype
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bsz, h, w = latents.shape[0], latents.shape[-2], latents.shape[-1]
     assert bsz > 0, "Batch size not large enough"
     num_timesteps = noise_scheduler.config.num_train_timesteps
+
+    # Restrict the *raw* sampling quantile to a sub-range BEFORE any distribution shaping
+    # (sigmoid / discrete_flow_shift / flux_shift / logit_normal). (0.0, 1.0) == no restriction.
+    q_lo, q_hi = get_timestep_quantile_range(args)
+
     if args.timestep_sampling == "uniform" or args.timestep_sampling == "sigmoid":
         # Simple random sigma-based noise sampling
         if args.timestep_sampling == "sigmoid":
             # https://github.com/XLabs-AI/x-flux/tree/main
-            sigmas = torch.sigmoid(args.sigmoid_scale * torch.randn((bsz,), device=device))
+            sigmas = torch.sigmoid(args.sigmoid_scale * _sample_base_normal(bsz, q_lo, q_hi, device))
         else:
-            sigmas = torch.rand((bsz,), device=device)
+            sigmas = _sample_base_uniform(bsz, q_lo, q_hi, device)
 
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "shift":
         shift = args.discrete_flow_shift
-        sigmas = torch.randn(bsz, device=device)
+        sigmas = _sample_base_normal(bsz, q_lo, q_hi, device)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         sigmas = (sigmas * shift) / (1 + (shift - 1) * sigmas)
         timesteps = sigmas * num_timesteps
     elif args.timestep_sampling == "flux_shift":
-        sigmas = torch.randn(bsz, device=device)
+        sigmas = _sample_base_normal(bsz, q_lo, q_hi, device)
         sigmas = sigmas * args.sigmoid_scale  # larger scale for more uniform sampling
         sigmas = sigmas.sigmoid()
         mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))  # we are pre-packed so must adjust for packed size
@@ -501,13 +572,19 @@ def get_noisy_model_input_and_timesteps(
         timesteps = sigmas * num_timesteps
     else:
         # Sample a random timestep for each image
-        # for weighting schemes where we sample timesteps non-uniformly
+        # for weighting schemes where we sample timesteps non-uniformly.
+        # NOTE: here timesteps come from noise_scheduler.timesteps, which is DESCENDING (index 0 -> t=1000),
+        # so a low quantile maps to HIGH noise -- the opposite of the sigma-based branches above. Mirror the
+        # block band to [1-hi, 1-lo] so block_idx keeps the same "low index = low-noise timesteps" meaning
+        # across all --timestep_sampling modes.
+        base_u = None if (q_lo, q_hi) == (0.0, 1.0) else _sample_base_uniform(bsz, 1.0 - q_hi, 1.0 - q_lo, torch.device("cpu"))
         u = compute_density_for_timestep_sampling(
             weighting_scheme=args.weighting_scheme,
             batch_size=bsz,
             logit_mean=args.logit_mean,
             logit_std=args.logit_std,
             mode_scale=args.mode_scale,
+            base_u=base_u,
         )
         indices = (u * num_timesteps).long()
         timesteps = noise_scheduler.timesteps[indices].to(device=device)
@@ -557,6 +634,11 @@ def get_timestep_sampling_info(args) -> str:
         parts.append(f"sigmoid_scale={args.sigmoid_scale}")
     if sampling == "sigma":
         parts.append(f"weighting_scheme={args.weighting_scheme}")
+    q_lo, q_hi = get_timestep_quantile_range(args)
+    if (q_lo, q_hi) != (0.0, 1.0):
+        total = getattr(args, "timestep_total_blocks", None)
+        idx = getattr(args, "timestep_block_idx", None) or 0
+        parts.append(f"timestep_block={idx}/{total} (raw quantile [{q_lo:.3f}, {q_hi:.3f}) applied BEFORE shaping)")
     return ", ".join(parts)
 
 

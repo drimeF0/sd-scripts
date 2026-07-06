@@ -113,6 +113,22 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         help="Scale factor for sigmoid (logit_normal) timestep sampling (default: 1.0)",
     )
     parser.add_argument(
+        "--timestep_total_blocks",
+        type=int,
+        default=None,
+        help="Split the [0,1] timestep-sampling quantile into this many equal blocks and train only on one of "
+        "them (selected by --timestep_block_idx). The restriction is applied to the RAW quantile BEFORE any "
+        "distribution shaping (sigmoid / discrete_flow_shift / flux_shift / logit_normal), so the shaping still "
+        "controls the density inside the block. Default None = full range (no restriction).",
+    )
+    parser.add_argument(
+        "--timestep_block_idx",
+        type=int,
+        default=None,
+        help="0-based block to sample when --timestep_total_blocks is set. E.g. total_blocks=3: idx=0 -> quantile "
+        "[0.0, 0.333) (low-noise / details), idx=2 -> [0.666, 1.0) (high-noise / structure). Default None = 0.",
+    )
+    parser.add_argument(
         "--attn_mode",
         choices=["torch", "xformers", "flash", "sageattn", "sdpa"],  # "sdpa" is for backward compatibility
         default=None,
