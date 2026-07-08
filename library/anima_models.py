@@ -1102,9 +1102,18 @@ class Anima(nn.Module):
         self.attn_mode = attn_mode
         self.split_attn = split_attn
 
-        # Block swap support
+        # Block swap support (GPU <-> CPU RAM streaming)
         self.blocks_to_swap = None
         self.offloader: Optional[custom_offloading_utils.ModelOffloader] = None
+
+        # DiT block offload to a second GPU (model parallelism).
+        # When enabled, the last `dit_offload_blocks` transformer blocks live and
+        # compute on `dit_offload_device` (e.g. cuda:1) while the rest of the model
+        # stays on `dit_main_device` (e.g. cuda:0). Hidden states are transferred
+        # across the device boundary; autograd handles the backward transfer.
+        self.dit_offload_blocks: int = 0
+        self.dit_main_device: Optional[torch.device] = None
+        self.dit_offload_device: Optional[torch.device] = None
 
         self.build_patch_embed()
         self.build_pos_embed()
@@ -1171,6 +1180,10 @@ class Anima(nn.Module):
 
     @property
     def device(self):
+        # With DiT offload enabled the model spans two GPUs; the "main" device
+        # (where inputs/outputs live) is the one callers expect from `.device`.
+        if self.dit_main_device is not None:
+            return self.dit_main_device
         return next(self.parameters()).device
 
     @property
@@ -1250,6 +1263,50 @@ class Anima(nn.Module):
             t=self.patch_temporal,
         )
         return x_B_C_Tt_Hp_Wp
+
+    def enable_dit_offload(
+        self,
+        num_blocks: int,
+        main_device: torch.device,
+        offload_device: torch.device,
+    ):
+        """Offload the last ``num_blocks`` DiT blocks to a second GPU (model parallelism).
+
+        The offloaded blocks (weights, gradients, optimizer states and their
+        activations) live on ``offload_device``; the rest of the model stays on
+        ``main_device``. This frees VRAM on the main GPU so a larger batch fits.
+        Must be called before the optimizer takes its first step so that the
+        optimizer states are created on the correct device.
+        """
+        assert self.blocks_to_swap in (None, 0), "DiT offload cannot be combined with block swap (--blocks_to_swap)."
+        assert 0 < num_blocks < self.num_blocks, (
+            f"dit_offload_blocks must be in (0, {self.num_blocks}). Requested: {num_blocks}."
+        )
+
+        self.dit_offload_blocks = num_blocks
+        self.dit_main_device = torch.device(main_device)
+        self.dit_offload_device = torch.device(offload_device)
+        logger.info(
+            f"Anima: DiT offload enabled. Offloading last {num_blocks}/{self.num_blocks} blocks "
+            f"to {self.dit_offload_device}, main device: {self.dit_main_device}."
+        )
+
+    def move_to_device_with_dit_offload(self, main_device: torch.device):
+        """Move the whole model to ``main_device``, then move the offloaded blocks to their GPU.
+
+        Analogous to ``move_to_device_except_swap_blocks`` but the "parked" blocks
+        end up resident on the second GPU instead of CPU RAM.
+        """
+        if not self.dit_offload_blocks:
+            self.to(main_device)
+            return
+
+        self.dit_main_device = torch.device(main_device)
+        self.to(self.dit_main_device)
+
+        boundary = self.num_blocks - self.dit_offload_blocks
+        for block in self.blocks[boundary:]:
+            block.to(self.dit_offload_device)
 
     def enable_block_swap(self, num_blocks: int, device: torch.device):
         self.blocks_to_swap = num_blocks
@@ -1346,14 +1403,37 @@ class Anima(nn.Module):
         # Determine whether to use float32 for block computations based on input dtype (use float32 for better stability when input is float16)
         use_fp32 = x_B_T_H_W_D.dtype == torch.float16
 
+        # DiT offload (model parallelism): the last `dit_offload_blocks` blocks live on a
+        # second GPU. We transfer the hidden state and the shared per-block tensors across
+        # the boundary once; autograd transfers the gradients back on the backward pass.
+        offload_boundary = self.num_blocks - self.dit_offload_blocks if self.dit_offload_blocks else None
+        # Local aliases so the main-device `t_embedding_B_T_D` / `adaln_lora_B_T_3D` remain
+        # available for the final layer, which runs back on the main device.
+        hidden = x_B_T_H_W_D
+        t_emb = t_embedding_B_T_D
+        cross = crossattn_emb
+        kwargs = block_kwargs
+
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
 
-            x_B_T_H_W_D = block(x_B_T_H_W_D, t_embedding_B_T_D, crossattn_emb, attn_params, use_fp32, **block_kwargs)
+            if offload_boundary is not None and block_idx == offload_boundary:
+                # Cross onto the offload GPU for the remaining blocks.
+                hidden = hidden.to(self.dit_offload_device)
+                t_emb = t_emb.to(self.dit_offload_device)
+                cross = cross.to(self.dit_offload_device)
+                kwargs = to_device(block_kwargs, self.dit_offload_device)
+
+            hidden = block(hidden, t_emb, cross, attn_params, use_fp32, **kwargs)
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
+
+        if offload_boundary is not None:
+            # Bring the hidden state back to the main device for the final layer.
+            hidden = hidden.to(self.dit_main_device)
+        x_B_T_H_W_D = hidden
 
         x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)

@@ -81,6 +81,14 @@ def train(args):
         args.blocks_to_swap is None or args.blocks_to_swap == 0
     ) or not args.unsloth_offload_checkpointing, "blocks_to_swap is not supported with unsloth_offload_checkpointing"
 
+    if args.dit_offload_blocks is not None and args.dit_offload_blocks > 0:
+        assert (
+            args.blocks_to_swap is None or args.blocks_to_swap == 0
+        ), "--dit_offload_blocks cannot be combined with --blocks_to_swap"
+        assert torch.cuda.is_available() and torch.cuda.device_count() >= 2, (
+            "--dit_offload_blocks requires at least 2 CUDA devices"
+        )
+
     cache_latents = args.cache_latents
     use_dreambooth_method = args.in_json is None
 
@@ -267,6 +275,15 @@ def train(args):
         logger.info(f"Enable block swap: blocks_to_swap={args.blocks_to_swap}")
         dit.enable_block_swap(args.blocks_to_swap, accelerator.device)
 
+    # DiT offload to a second GPU (model parallelism)
+    is_offloading_dit = args.dit_offload_blocks is not None and args.dit_offload_blocks > 0
+    if is_offloading_dit:
+        offload_device = torch.device(args.dit_offload_device)
+        logger.info(
+            f"Enable DiT offload: dit_offload_blocks={args.dit_offload_blocks}, device={offload_device}"
+        )
+        dit.enable_dit_offload(args.dit_offload_blocks, accelerator.device, offload_device)
+
     if not cache_latents:
         vae.requires_grad_(False)
         vae.eval()
@@ -370,9 +387,14 @@ def train(args):
         training_models = [ds_model]
     else:
         if train_dit:
-            dit = accelerator.prepare(dit, device_placement=[not is_swapping_blocks])
+            # Let us manage device placement when block-swap or DiT offload is active,
+            # since both split the model across devices.
+            manual_placement = is_swapping_blocks or is_offloading_dit
+            dit = accelerator.prepare(dit, device_placement=[not manual_placement])
             if is_swapping_blocks:
                 accelerator.unwrap_model(dit).move_to_device_except_swap_blocks(accelerator.device)
+            elif is_offloading_dit:
+                accelerator.unwrap_model(dit).move_to_device_with_dit_offload(accelerator.device)
         optimizer, train_dataloader, lr_scheduler = accelerator.prepare(optimizer, train_dataloader, lr_scheduler)
 
     # Move non-training models back to GPU

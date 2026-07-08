@@ -718,6 +718,26 @@ def add_dit_training_arguments(parser: argparse.ArgumentParser):
         " / 順伝播および逆伝播中にスワップするブロックの数を設定します。"
         "この数を増やすと、トレーニング中のVRAM使用量が減りますが、トレーニング速度（s/it）も低下します。",
     )
+    parser.add_argument(
+        "--dit_offload_blocks",
+        type=int,
+        default=None,
+        help="[EXPERIMENTAL] "
+        "Number of trailing DiT blocks to offload onto a second GPU (model parallelism). "
+        "These blocks (weights, gradients, optimizer states and activations) live and compute on "
+        "--dit_offload_device, freeing VRAM on the main GPU so a larger batch fits. "
+        "Cannot be combined with --blocks_to_swap. "
+        " / 2枚目のGPUにオフロードする末尾のDiTブロック数（モデル並列）。"
+        "対象ブロックの重み・勾配・オプティマイザ状態・活性化は --dit_offload_device 上に置かれ、"
+        "メインGPUのVRAMが空くためより大きなバッチが可能になります。--blocks_to_swap とは併用できません。",
+    )
+    parser.add_argument(
+        "--dit_offload_device",
+        type=str,
+        default="cuda:1",
+        help="Device that holds the offloaded DiT blocks when --dit_offload_blocks is set (default: cuda:1)."
+        " / --dit_offload_blocks 指定時にオフロード先となるデバイス（デフォルト: cuda:1）。",
+    )
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):
