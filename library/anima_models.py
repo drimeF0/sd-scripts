@@ -352,13 +352,30 @@ class Attention(nn.Module):
 
         return q, k, v
 
+    def compute_kv(self, context: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Keys and values for an additional context, reusing this attention's projections."""
+        k = self.k_proj(context)
+        v = self.v_proj(context)
+        k, v = map(
+            lambda t: rearrange(t, "b ... (h d) -> b ... h d", h=self.n_heads, d=self.head_dim),
+            (k, v),
+        )
+        return self.k_norm(k), self.v_norm(v)
+
     def forward(
         self,
         x: torch.Tensor,
         attn_params: attention.AttentionParams,
         context: Optional[torch.Tensor] = None,
         rope_emb: Optional[torch.Tensor] = None,
+        extra_context: Optional[torch.Tensor] = None,
+        extra_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        extra_context / extra_gate: optional second context (e.g. DINOv3 image tokens) attended to in a separate,
+        decoupled attention whose result is added through `extra_gate` (IP-Adapter style). A zero gate makes this
+        an exact no-op, unlike concatenating the tokens to `context`, which would take softmax mass away from it.
+        """
         q, k, v = self.compute_qkv(x, context, rope_emb=rope_emb)
         if q.dtype != v.dtype:
             if (not attn_params.supports_fp32 or attn_params.requires_same_dtype) and torch.is_autocast_enabled():
@@ -366,10 +383,24 @@ class Attention(nn.Module):
                 target_dtype = v.dtype  # v has fp16/bf16 dtype
                 q = q.to(target_dtype)
                 k = k.to(target_dtype)
-        # return self.compute_attention(q, k, v)
-        qkv = [q, k, v]
-        del q, k, v
-        result = attention.attention(qkv, attn_params=attn_params)
+
+        if extra_context is None:
+            # return self.compute_attention(q, k, v)
+            qkv = [q, k, v]
+            del q, k, v
+            result = attention.attention(qkv, attn_params=attn_params)
+            return self.output_dropout(self.output_proj(result))
+
+        result = attention.attention(q, k, v, attn_params=attn_params)
+        del k, v
+
+        extra_k, extra_v = self.compute_kv(extra_context)
+        if q.dtype != extra_v.dtype:
+            extra_k = extra_k.to(q.dtype)
+            extra_v = extra_v.to(q.dtype)
+        extra_result = attention.attention(q, extra_k, extra_v, attn_params=attn_params)
+        result = result + extra_gate.to(result.dtype) * extra_result.to(result.dtype)
+
         return self.output_dropout(self.output_proj(result))
 
 
@@ -867,6 +898,8 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        dinov3_emb: Optional[torch.Tensor] = None,
+        dinov3_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if use_fp32:
             # Cast to float32 for better numerical stability in residual connections. Each module will cast back to float16 by enclosing autocast context.
@@ -938,6 +971,8 @@ class Block(nn.Module):
                 attn_params,
                 crossattn_emb,
                 rope_emb=rope_emb_L_1_1_D,
+                extra_context=dinov3_emb,
+                extra_gate=dinov3_gate,
             ),
             "b (t h w) d -> b t h w d",
             t=T,
@@ -963,7 +998,11 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        dinov3_emb: Optional[torch.Tensor] = None,
+        dinov3_gate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # dinov3_emb / dinov3_gate travel as explicit arguments (not as module state) so that every gradient
+        # checkpointing path recomputes with them and returns their gradients.
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
                 # Unsloth: async non-blocking CPU RAM offload (fastest offload method)
@@ -977,6 +1016,8 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    dinov3_emb,
+                    dinov3_gate,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -1000,6 +1041,8 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    dinov3_emb,
+                    dinov3_gate,
                     use_reentrant=False,
                 )
             else:
@@ -1014,6 +1057,8 @@ class Block(nn.Module):
                     rope_emb_L_1_1_D,
                     adaln_lora_B_T_3D,
                     extra_per_block_pos_emb,
+                    dinov3_emb,
+                    dinov3_gate,
                     use_reentrant=False,
                 )
         else:
@@ -1026,6 +1071,8 @@ class Block(nn.Module):
                 rope_emb_L_1_1_D,
                 adaln_lora_B_T_3D,
                 extra_per_block_pos_emb,
+                dinov3_emb,
+                dinov3_gate,
             )
 
 
@@ -1358,6 +1405,8 @@ class Anima(nn.Module):
         source_attention_mask: Optional[torch.Tensor] = None,
         t5_input_ids: Optional[torch.Tensor] = None,
         t5_attn_mask: Optional[torch.Tensor] = None,
+        dinov3_emb: Optional[torch.Tensor] = None,
+        dinov3_gates: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -1369,6 +1418,8 @@ class Anima(nn.Module):
             source_attention_mask: Optional attention mask for Qwen3 embeddings (used with LLM adapter)
             t5_input_ids: Optional T5 token IDs (triggers LLM adapter when provided)
             t5_attn_mask: Optional T5 attention mask
+            dinov3_emb: Optional (B, N, D) image tokens attended to in a decoupled cross-attention per block
+            dinov3_gates: (num_blocks,) gates for that attention, one per block (zero = disabled)
         """
         # Run LLM adapter inside forward for correct DDP gradient synchronization
         if t5_input_ids is not None and self.use_llm_adapter and hasattr(self, "llm_adapter"):
@@ -1412,6 +1463,8 @@ class Anima(nn.Module):
         hidden = x_B_T_H_W_D
         t_emb = t_embedding_B_T_D
         cross = crossattn_emb
+        dino = dinov3_emb
+        gates = dinov3_gates
         kwargs = block_kwargs
 
         for block_idx, block in enumerate(self.blocks):
@@ -1423,9 +1476,22 @@ class Anima(nn.Module):
                 hidden = hidden.to(self.dit_offload_device)
                 t_emb = t_emb.to(self.dit_offload_device)
                 cross = cross.to(self.dit_offload_device)
+                if dino is not None:
+                    dino = dino.to(self.dit_offload_device)
+                if gates is not None:
+                    gates = gates.to(self.dit_offload_device)
                 kwargs = to_device(block_kwargs, self.dit_offload_device)
 
-            hidden = block(hidden, t_emb, cross, attn_params, use_fp32, **kwargs)
+            hidden = block(
+                hidden,
+                t_emb,
+                cross,
+                attn_params,
+                use_fp32,
+                **kwargs,
+                dinov3_emb=dino,
+                dinov3_gate=None if gates is None else gates[block_idx],
+            )
 
             if self.blocks_to_swap:
                 self.offloader.submit_move_blocks(self.blocks, block_idx)
