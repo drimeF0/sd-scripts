@@ -24,6 +24,7 @@ from library import (
 import library.args as args_util
 import library.compile_utils as compile_utils
 import library.model_io as model_io
+import library.xm as xm_util
 from library.dataset import DatasetGroup, MinimalDataset
 import train_network
 from library.utils import setup_logging
@@ -279,11 +280,29 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         train_unet,
         is_train=True,
     ):
+        # Fallback for 5D latents (old cache)
+        if latents.ndim == 5:
+            latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
+
+        # Use Explorative Modeling (XM) if enabled
+        if args.xm_best_of_k > 1:
+            return xm_util.compute_anima_xm_loss_for_network(
+                args,
+                accelerator,
+                noise_scheduler,
+                latents,
+                batch,
+                text_encoder_conds,
+                unet,
+                weight_dtype,
+                train_unet,
+                is_train=is_train,
+            )
+
+        # Standard training (no exploration)
         anima: anima_models.Anima = unet
 
         # Sample noise
-        if latents.ndim == 5:  # Fallback for 5D latents (old cache)
-            latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
         noise = torch.randn_like(latents)
 
         # Get noisy model input and timesteps
@@ -450,6 +469,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
+    xm_util.add_xm_arguments(parser)
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument(
         "--unsloth_offload_checkpointing",

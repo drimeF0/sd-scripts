@@ -30,6 +30,7 @@ import library.logging_util as logging_util
 import library.loss as loss_util
 import library.checkpoint_io as checkpoint_io
 import library.sampling as sampling
+import library.xm as xm_util
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -555,20 +556,6 @@ def train(args):
                 t5_input_ids = t5_input_ids.to(accelerator.device, dtype=torch.long)
                 t5_attn_mask = t5_attn_mask.to(accelerator.device)
 
-                # Noise and timesteps
-                noise = torch.randn_like(latents)
-
-                # Get noisy model input and timesteps
-                noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-                    args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
-                )
-                timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
-
-                # NaN checks
-                if torch.any(torch.isnan(noisy_model_input)):
-                    accelerator.print("NaN found in noisy_model_input, replacing with zeros")
-                    noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
-
                 # Create padding mask
                 # padding_mask: (B, 1, H_latent, W_latent)
                 bs = latents.shape[0]
@@ -576,41 +563,73 @@ def train(args):
                 w_latent = latents.shape[-1]
                 padding_mask = torch.zeros(bs, 1, h_latent, w_latent, dtype=dit_weight_dtype, device=accelerator.device)
 
-                # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
-                noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
-                with accelerator.autocast():
-                    model_pred = dit(
-                        noisy_model_input,
-                        timesteps,
-                        prompt_embeds,
-                        padding_mask=padding_mask,
-                        source_attention_mask=attn_mask,
-                        t5_input_ids=t5_input_ids,
-                        t5_attn_mask=t5_attn_mask,
+                # Compute loss (with optional Explorative Modeling / XM)
+                if args.xm_best_of_k <= 1:
+                    # Standard training (no exploration)
+                    noise = torch.randn_like(latents)
+
+                    # Get noisy model input and timesteps
+                    noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
+                        args, noise_scheduler_copy, latents, noise, accelerator.device, dit_weight_dtype
                     )
-                model_pred = model_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
+                    timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
-                # Compute loss (rectified flow: target = noise - latents)
-                target = noise - latents
+                    # NaN checks
+                    if torch.any(torch.isnan(noisy_model_input)):
+                        accelerator.print("NaN found in noisy_model_input, replacing with zeros")
+                        noisy_model_input = torch.nan_to_num(noisy_model_input, 0, out=noisy_model_input)
 
-                # Weighting
-                weighting = anima_train_utils.compute_loss_weighting_for_anima(
-                    weighting_scheme=args.weighting_scheme, sigmas=sigmas
-                )
+                    # DiT forward (LLM adapter runs inside forward for DDP gradient sync)
+                    noisy_model_input = noisy_model_input.unsqueeze(2)  # 4D to 5D, (B, C, 1, H, W)
+                    with accelerator.autocast():
+                        model_pred = dit(
+                            noisy_model_input,
+                            timesteps,
+                            prompt_embeds,
+                            padding_mask=padding_mask,
+                            source_attention_mask=attn_mask,
+                            t5_input_ids=t5_input_ids,
+                            t5_attn_mask=t5_attn_mask,
+                        )
+                    model_pred = model_pred.squeeze(2)  # 5D to 4D, (B, C, H, W)
 
-                # Loss
-                huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
-                loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
-                if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
-                    loss = apply_masked_loss(loss, batch)
-                loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
+                    # Compute loss (rectified flow: target = noise - latents)
+                    target = noise - latents
 
-                if weighting is not None:
-                    loss = loss * weighting
+                    # Weighting
+                    weighting = anima_train_utils.compute_loss_weighting_for_anima(
+                        weighting_scheme=args.weighting_scheme, sigmas=sigmas
+                    )
 
-                loss_weights = batch["loss_weights"]
-                loss = loss * loss_weights
-                loss = loss.mean()
+                    # Loss
+                    huber_c = loss_util.get_huber_threshold_if_needed(args, timesteps, None)
+                    loss = loss_util.conditional_loss(model_pred.float(), target.float(), args.loss_type, "none", huber_c)
+                    if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        loss = apply_masked_loss(loss, batch)
+                    loss = loss.mean([1, 2, 3])  # (B, C, H, W) -> (B,)
+
+                    if weighting is not None:
+                        loss = loss * weighting
+
+                    loss_weights = batch["loss_weights"]
+                    loss = loss * loss_weights
+                    loss = loss.mean()
+                else:
+                    # Explorative Modeling (XM): explore over K noise candidates
+                    loss = xm_util.compute_anima_xm_loss(
+                        args,
+                        dit,
+                        latents,
+                        noise_scheduler_copy,
+                        prompt_embeds,
+                        attn_mask,
+                        t5_input_ids,
+                        t5_attn_mask,
+                        padding_mask,
+                        accelerator,
+                        dit_weight_dtype,
+                        batch=batch,
+                    )
 
                 accelerator.backward(loss)
 
@@ -753,6 +772,7 @@ def setup_parser() -> argparse.ArgumentParser:
     add_custom_train_arguments(parser)
     args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
+    xm_util.add_xm_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
 
     parser.add_argument(
