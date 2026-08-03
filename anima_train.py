@@ -801,6 +801,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args_util.verify_command_line_training_args(args)
     args = args_util.read_config_from_file(args, parser)
+    xm_util.validate_xm_args(args)
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
